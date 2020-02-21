@@ -80,6 +80,12 @@ description = """
 Algorithms for making data smaller.\
 """
 
+[computer-vision]
+name = "Computer vision"
+description = """
+Crates for comprehending the world from video or images.\
+"""
+
 [config]
 name = "Configuration"
 description = """
@@ -227,7 +233,15 @@ Crates for dealing with files and filesystems.\
 [game-engines]
 name = "Game engines"
 description = """
-Crates for creating games.\
+For crates that try to provide a \"one-stop-shop\" for \
+all of your game development needs.\
+"""
+
+[game-development]
+name = "Game development"
+description = """
+For crates that focus on some individual part of accelerating \
+the development of games.\
 """
 
 [games]
@@ -270,6 +284,12 @@ name = "Localization (L10n)"
 description = """
 Crates to help adapting internationalized software to specific \
 languages and regions.\
+"""
+
+[mathematics]
+name = "Mathematics"
+description = """
+Crates with a mathematical aspect.
 """
 
 [memory-management]
@@ -398,7 +418,7 @@ Rust.\
 [science]
 name = "Science"
 description = """
-Crates related to solving problems involving math, physics, chemistry, \
+Crates related to solving problems involving physics, chemistry, \
 biology, machine learning, geoscience, and other scientific fields.\
 """
 

@@ -5,11 +5,10 @@ use crate::models::Keyword;
 use crate::views::EncodableKeyword;
 
 /// Handles the `GET /keywords` route.
-pub fn index(req: &mut dyn Request) -> CargoResult<Response> {
+pub fn index(req: &mut dyn Request) -> AppResult<Response> {
     use crate::schema::keywords;
 
     let conn = req.db_conn()?;
-    let (offset, limit) = req.pagination(10, 100)?;
     let query = req.query();
     let sort = query.get("sort").map(|s| &s[..]).unwrap_or("alpha");
 
@@ -21,14 +20,9 @@ pub fn index(req: &mut dyn Request) -> CargoResult<Response> {
         query = query.order(keywords::keyword.asc());
     }
 
-    let data = query
-        .paginate(limit, offset)
-        .load::<(Keyword, i64)>(&*conn)?;
-    let total = data.get(0).map(|&(_, t)| t).unwrap_or(0);
-    let kws = data
-        .into_iter()
-        .map(|(k, _)| k.encodable())
-        .collect::<Vec<_>>();
+    let data = query.paginate(&req.query())?.load::<Keyword>(&*conn)?;
+    let total = data.total();
+    let kws = data.into_iter().map(Keyword::encodable).collect::<Vec<_>>();
 
     #[derive(Serialize)]
     struct R {
@@ -37,7 +31,7 @@ pub fn index(req: &mut dyn Request) -> CargoResult<Response> {
     }
     #[derive(Serialize)]
     struct Meta {
-        total: i64,
+        total: Option<i64>,
     }
 
     Ok(req.json(&R {
@@ -47,7 +41,7 @@ pub fn index(req: &mut dyn Request) -> CargoResult<Response> {
 }
 
 /// Handles the `GET /keywords/:keyword_id` route.
-pub fn show(req: &mut dyn Request) -> CargoResult<Response> {
+pub fn show(req: &mut dyn Request) -> AppResult<Response> {
     let name = &req.params()["keyword_id"];
     let conn = req.db_conn()?;
 

@@ -6,7 +6,8 @@ use crate::{
 };
 use cargo_registry::{
     models::{Email, NewUser, User},
-    views::{EncodablePrivateUser, EncodablePublicUser, EncodableVersion},
+    schema::crate_owners,
+    views::{EncodablePrivateUser, EncodablePublicUser, EncodableVersion, OwnedCrate},
 };
 
 use diesel::prelude::*;
@@ -25,11 +26,18 @@ pub struct UserShowPublicResponse {
 #[derive(Deserialize)]
 pub struct UserShowPrivateResponse {
     pub user: EncodablePrivateUser,
+    pub owned_crates: Vec<OwnedCrate>,
 }
 
 #[derive(Deserialize)]
 struct UserStats {
     total_downloads: i64,
+}
+
+#[derive(Serialize)]
+struct EmailNotificationsUpdate {
+    id: i32,
+    email_notifications: bool,
 }
 
 impl crate::util::MockCookieUser {
@@ -65,6 +73,14 @@ impl crate::util::MockCookieUser {
         let url = format!("/api/v1/confirm/{}", email_token);
         self.put(&url, &[]).good()
     }
+
+    fn update_email_notifications(&self, updates: Vec<EmailNotificationsUpdate>) -> OkBool {
+        self.put(
+            "/api/v1/me/email_notifications",
+            json!(updates).to_string().as_bytes(),
+        )
+        .good()
+    }
 }
 
 impl crate::util::MockAnonymousUser {
@@ -90,14 +106,16 @@ impl crate::util::MockAnonymousUser {
 #[test]
 fn auth_gives_a_token() {
     let (_, anon) = TestApp::init().empty();
-    let json: AuthResponse = anon.get("/authorize_url").good();
+    let json: AuthResponse = anon.get("/api/private/session/begin").good();
     assert!(json.url.contains(&json.state));
 }
 
 #[test]
 fn access_token_needs_data() {
     let (_, anon) = TestApp::init().empty();
-    let json = anon.get::<()>("/authorize").bad_with_status(200); // Change endpoint to 400?
+    let json = anon
+        .get::<()>("/api/private/session/authorize")
+        .bad_with_status(400);
     assert!(json.errors[0].detail.contains("invalid state"));
 }
 
@@ -110,7 +128,15 @@ fn me() {
     let user = app.db_new_user("foo");
     let json = user.show_me();
 
-    assert_eq!(json.user.email, user.as_model().email);
+    assert_eq!(json.owned_crates.len(), 0);
+
+    app.db(|conn| {
+        CrateBuilder::new("foo_my_packages", user.as_model().id).expect_build(conn);
+        assert_eq!(json.user.email, user.as_model().email(conn).unwrap());
+    });
+    let updated_json = user.show_me();
+
+    assert_eq!(updated_json.owned_crates.len(), 1);
 }
 
 #[test]
@@ -141,21 +167,19 @@ fn show_latest_user_case_insensitively() {
         t!(NewUser::new(
             1,
             "foobar",
-            Some("foo@bar.com"),
             Some("I was first then deleted my github account"),
             None,
             "bar"
         )
-        .create_or_update(conn));
+        .create_or_update(None, conn));
         t!(NewUser::new(
             2,
             "FOOBAR",
-            Some("later-foo@bar.com"),
             Some("I was second, I took the foobar username on github"),
             None,
             "bar"
         )
-        .create_or_update(conn));
+        .create_or_update(None, conn));
     });
 
     let json: UserShowPublicResponse = anon.get("api/v1/users/fOObAr").good();
@@ -272,7 +296,7 @@ fn following() {
     assert_eq!(r.meta.more, false);
 
     user.get_with_query::<()>("/api/v1/me/updates", "page=0")
-        .bad_with_status(200); // TODO: Should be 500
+        .bad_with_status(400);
 }
 
 #[test]
@@ -299,11 +323,22 @@ fn user_total_downloads() {
             .set(&another_krate)
             .execute(conn)
             .unwrap();
+
+        let mut no_longer_my_krate = CrateBuilder::new("nacho", user.id).expect_build(conn);
+        no_longer_my_krate.downloads = 5;
+        update(&no_longer_my_krate)
+            .set(&no_longer_my_krate)
+            .execute(conn)
+            .unwrap();
+        no_longer_my_krate
+            .owner_remove(app.as_inner(), conn, user, &user.gh_login)
+            .unwrap();
     });
 
     let url = format!("/api/v1/users/{}/stats", user.id);
     let stats: UserStats = anon.get(&url).good();
-    assert_eq!(stats.total_downloads, 30); // instead of 32
+    // does not include crates user never owned (2) or no longer owns (5)
+    assert_eq!(stats.total_downloads, 30);
 }
 
 #[test]
@@ -324,7 +359,7 @@ fn updating_existing_user_doesnt_change_api_token() {
 
     let user = app.db(|conn| {
         // Reuse gh_id but use new gh_login and gh_access_token
-        t!(NewUser::new(gh_id, "bar", None, None, None, "bar_token").create_or_update(conn));
+        t!(NewUser::new(gh_id, "bar", None, None, "bar_token").create_or_update(None, conn));
 
         // Use the original API token to find the now updated user
         t!(User::find_by_api_token(conn, token))
@@ -353,7 +388,7 @@ fn github_without_email_does_not_overwrite_email() {
     // Don't use app.db_new_user because it adds a verified email.
     let user_without_github_email = app.db(|conn| {
         let u = new_user("arbitrary_username");
-        let u = u.create_or_update(conn).unwrap();
+        let u = u.create_or_update(None, conn).unwrap();
         MockCookieUser::new(&app, u)
     });
     let user_without_github_email_model = user_without_github_email.as_model();
@@ -373,7 +408,7 @@ fn github_without_email_does_not_overwrite_email() {
             // new_user uses a None email; the rest of the fields are arbitrary
             ..new_user("arbitrary_username")
         };
-        let u = u.create_or_update(conn).unwrap();
+        let u = u.create_or_update(None, conn).unwrap();
         MockCookieUser::new(&app, u)
     });
 
@@ -386,9 +421,16 @@ fn github_without_email_does_not_overwrite_email() {
 */
 #[test]
 fn github_with_email_does_not_overwrite_email() {
+    use cargo_registry::schema::emails;
+
     let (app, _, user) = TestApp::init().with_user();
     let model = user.as_model();
-    let original_email = &model.email;
+    let original_email = app.db(|conn| {
+        Email::belonging_to(model)
+            .select(emails::email)
+            .first::<String>(&*conn)
+            .unwrap()
+    });
 
     let new_github_email = "new-email-in-github@example.com";
 
@@ -397,16 +439,15 @@ fn github_with_email_does_not_overwrite_email() {
         let u = NewUser {
             // Use the same github ID to link to the existing account
             gh_id: model.gh_id,
-            email: Some(new_github_email),
             // the rest of the fields are arbitrary
             ..new_user("arbitrary_username")
         };
-        let u = u.create_or_update(conn).unwrap();
+        let u = u.create_or_update(Some(new_github_email), conn).unwrap();
         MockCookieUser::new(&app, u)
     });
 
     let json = user_with_different_email_in_github.show_me();
-    assert_eq!(json.user.email, *original_email);
+    assert_eq!(json.user.email, Some(original_email));
 }
 
 /*  Given a crates.io user, check that the user's email can be
@@ -445,7 +486,7 @@ fn test_empty_email_not_added() {
 
     let json = user
         .update_email_more_control(model.id, Some(""))
-        .bad_with_status(200);
+        .bad_with_status(400);
     assert!(
         json.errors[0].detail.contains("empty email rejected"),
         "{:?}",
@@ -454,7 +495,7 @@ fn test_empty_email_not_added() {
 
     let json = user
         .update_email_more_control(model.id, None)
-        .bad_with_status(200);
+        .bad_with_status(400);
 
     assert!(
         json.errors[0].detail.contains("empty email rejected"),
@@ -480,7 +521,7 @@ fn test_other_users_cannot_change_my_email() {
             another_user_model.id,
             Some("pineapple@pineapples.pineapple"),
         )
-        .bad_with_status(200);
+        .bad_with_status(400);
     assert!(
         json.errors[0]
             .detail
@@ -510,12 +551,13 @@ fn test_confirm_user_email() {
 
     // Simulate logging in via GitHub. Don't use app.db_new_user because it inserts a verified
     // email directly into the database and we want to test the verification flow here.
+    let email = "potato2@example.com";
+
     let user = app.db(|conn| {
         let u = NewUser {
-            email: Some("potato2@example.com"),
             ..new_user("arbitrary_username")
         };
-        let u = u.create_or_update(conn).unwrap();
+        let u = u.create_or_update(Some(email), conn).unwrap();
         MockCookieUser::new(&app, u)
     });
     let user_model = user.as_model();
@@ -549,12 +591,12 @@ fn test_existing_user_email() {
 
     // Simulate logging in via GitHub. Don't use app.db_new_user because it inserts a verified
     // email directly into the database and we want to test the verification flow here.
+    let email = "potahto@example.com";
     let user = app.db(|conn| {
         let u = NewUser {
-            email: Some("potahto@example.com"),
             ..new_user("arbitrary_username")
         };
-        let u = u.create_or_update(conn).unwrap();
+        let u = u.create_or_update(Some(email), conn).unwrap();
         update(Email::belonging_to(&u))
             // Users created before we added verification will have
             // `NULL` in the `token_generated_at` column.
@@ -568,4 +610,138 @@ fn test_existing_user_email() {
     assert_eq!(json.user.email.unwrap(), "potahto@example.com");
     assert!(!json.user.email_verified);
     assert!(!json.user.email_verification_sent);
+}
+
+#[test]
+fn test_user_owned_crates_doesnt_include_deleted_ownership() {
+    let (app, _, user) = TestApp::init().with_user();
+    let user_model = user.as_model();
+
+    app.db(|conn| {
+        let krate = CrateBuilder::new("foo_my_packages", user_model.id).expect_build(conn);
+        krate
+            .owner_remove(app.as_inner(), conn, user_model, &user_model.gh_login)
+            .unwrap();
+    });
+
+    let json = user.show_me();
+    assert_eq!(json.owned_crates.len(), 0);
+}
+
+/* A user should be able to update the email notifications for crates they own. Only the crates that
+   were sent in the request should be updated to the corresponding `email_notifications` value.
+*/
+#[test]
+fn test_update_email_notifications() {
+    let (app, _, user) = TestApp::init().with_user();
+
+    let my_crates = app.db(|conn| {
+        vec![
+            CrateBuilder::new("test_package", user.as_model().id).expect_build(&conn),
+            CrateBuilder::new("another_package", user.as_model().id).expect_build(&conn),
+        ]
+    });
+
+    let a_id = my_crates.get(0).unwrap().id;
+    let b_id = my_crates.get(1).unwrap().id;
+
+    // Update crate_a: email_notifications = false
+    // crate_a should be false, crate_b should be true
+    user.update_email_notifications(vec![EmailNotificationsUpdate {
+        id: a_id,
+        email_notifications: false,
+    }]);
+    let json = user.show_me();
+
+    assert_eq!(
+        json.owned_crates
+            .iter()
+            .find(|c| c.id == a_id)
+            .unwrap()
+            .email_notifications,
+        false
+    );
+    assert_eq!(
+        json.owned_crates
+            .iter()
+            .find(|c| c.id == b_id)
+            .unwrap()
+            .email_notifications,
+        true
+    );
+
+    // Update crate_b: email_notifications = false
+    // Both should be false now
+    user.update_email_notifications(vec![EmailNotificationsUpdate {
+        id: b_id,
+        email_notifications: false,
+    }]);
+    let json = user.show_me();
+
+    assert_eq!(
+        json.owned_crates
+            .iter()
+            .find(|c| c.id == a_id)
+            .unwrap()
+            .email_notifications,
+        false
+    );
+    assert_eq!(
+        json.owned_crates
+            .iter()
+            .find(|c| c.id == b_id)
+            .unwrap()
+            .email_notifications,
+        false
+    );
+
+    // Update crate_a and crate_b: email_notifications = true
+    // Both should be true
+    user.update_email_notifications(vec![
+        EmailNotificationsUpdate {
+            id: a_id,
+            email_notifications: true,
+        },
+        EmailNotificationsUpdate {
+            id: b_id,
+            email_notifications: true,
+        },
+    ]);
+    let json = user.show_me();
+
+    json.owned_crates.iter().for_each(|c| {
+        assert!(c.email_notifications);
+    })
+}
+
+/* A user should not be able to update the `email_notifications` value for a crate that is not
+   owned by them.
+*/
+#[test]
+fn test_update_email_notifications_not_owned() {
+    let (app, _, user) = TestApp::init().with_user();
+
+    let not_my_crate = app.db(|conn| {
+        let u = new_user("arbitrary_username")
+            .create_or_update(None, &conn)
+            .unwrap();
+        CrateBuilder::new("test_package", u.id).expect_build(&conn)
+    });
+
+    user.update_email_notifications(vec![EmailNotificationsUpdate {
+        id: not_my_crate.id,
+        email_notifications: false,
+    }]);
+
+    let email_notifications = app
+        .db(|conn| {
+            crate_owners::table
+                .select(crate_owners::email_notifications)
+                .filter(crate_owners::crate_id.eq(not_my_crate.id))
+                .first::<bool>(&*conn)
+        })
+        .unwrap();
+
+    // There should be no change to the `email_notifications` value for a crate not belonging to me
+    assert!(email_notifications);
 }

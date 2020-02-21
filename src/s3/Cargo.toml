@@ -6,6 +6,7 @@ authors = ["Alex Crichton <alex@alexcrichton.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-lang/crates.io"
 description = "Interaction between crates.io and S3 for storing crate files"
+edition = "2018"
 
 [lib]
 
@@ -16,4 +17,4 @@ path = "lib.rs"
 base64 = "0.6"
 chrono = "0.4"
 openssl = "0.10.13"
-reqwest = "0.9.1"
+reqwest = { version = "0.10", features = ["blocking"] }

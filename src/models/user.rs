@@ -1,11 +1,10 @@
-use diesel::dsl::now;
 use diesel::prelude::*;
 use std::borrow::Cow;
 
 use crate::app::App;
-use crate::util::CargoResult;
+use crate::util::errors::AppResult;
 
-use crate::models::{Crate, CrateOwner, Email, NewEmail, Owner, OwnerKind, Rights};
+use crate::models::{ApiToken, Crate, CrateOwner, Email, NewEmail, Owner, OwnerKind, Rights};
 use crate::schema::{crate_owners, emails, users};
 use crate::views::{EncodablePrivateUser, EncodablePublicUser};
 
@@ -13,7 +12,6 @@ use crate::views::{EncodablePrivateUser, EncodablePublicUser};
 #[derive(Clone, Debug, PartialEq, Eq, Queryable, Identifiable, AsChangeset, Associations)]
 pub struct User {
     pub id: i32,
-    pub email: Option<String>,
     pub gh_access_token: String,
     pub gh_login: String,
     pub name: Option<String>,
@@ -21,12 +19,12 @@ pub struct User {
     pub gh_id: i32,
 }
 
+/// Represents a new user record insertable to the `users` table
 #[derive(Insertable, Debug, Default)]
 #[table_name = "users"]
 pub struct NewUser<'a> {
     pub gh_id: i32,
     pub gh_login: &'a str,
-    pub email: Option<&'a str>,
     pub name: Option<&'a str>,
     pub gh_avatar: Option<&'a str>,
     pub gh_access_token: Cow<'a, str>,
@@ -36,7 +34,6 @@ impl<'a> NewUser<'a> {
     pub fn new(
         gh_id: i32,
         gh_login: &'a str,
-        email: Option<&'a str>,
         name: Option<&'a str>,
         gh_avatar: Option<&'a str>,
         gh_access_token: &'a str,
@@ -44,7 +41,6 @@ impl<'a> NewUser<'a> {
         NewUser {
             gh_id,
             gh_login,
-            email,
             name,
             gh_avatar,
             gh_access_token: Cow::Borrowed(gh_access_token),
@@ -52,7 +48,11 @@ impl<'a> NewUser<'a> {
     }
 
     /// Inserts the user into the database, or updates an existing one.
-    pub fn create_or_update(&self, conn: &PgConnection) -> QueryResult<User> {
+    pub fn create_or_update(
+        &self,
+        email: Option<&'a str>,
+        conn: &PgConnection,
+    ) -> QueryResult<User> {
         use crate::schema::users::dsl::*;
         use diesel::dsl::sql;
         use diesel::insert_into;
@@ -80,8 +80,8 @@ impl<'a> NewUser<'a> {
                 ))
                 .get_result::<User>(conn)?;
 
-            // To send the user an account verification email...
-            if let Some(user_email) = user.email.as_ref() {
+            // To send the user an account verification email
+            if let Some(user_email) = email {
                 let new_email = NewEmail {
                     user_id: user.id,
                     email: user_email,
@@ -105,35 +105,22 @@ impl<'a> NewUser<'a> {
 }
 
 impl User {
-    /// Queries the database for a user with a certain `api_token` value.
-    pub fn find_by_api_token(conn: &PgConnection, token_: &str) -> QueryResult<User> {
-        use crate::schema::api_tokens::dsl::{api_tokens, last_used_at, revoked, token, user_id};
-        use diesel::update;
-
-        let tokens = api_tokens
-            .filter(token.eq(token_))
-            .filter(revoked.eq(false));
-
-        // If the database is in read only mode, we can't update last_used_at.
-        // Try updating in a new transaction, if that fails, fall back to reading
-        let user_id_ = conn
-            .transaction(|| {
-                update(tokens)
-                    .set(last_used_at.eq(now.nullable()))
-                    .returning(user_id)
-                    .get_result::<i32>(conn)
-            })
-            .or_else(|_| tokens.select(user_id).first(conn))?;
-
-        users::table.find(user_id_).first(conn)
+    pub fn find(conn: &PgConnection, id: i32) -> QueryResult<User> {
+        users::table.find(id).first(conn)
     }
 
-    pub fn owning(krate: &Crate, conn: &PgConnection) -> CargoResult<Vec<Owner>> {
-        let base_query = CrateOwner::belonging_to(krate).filter(crate_owners::deleted.eq(false));
-        let users = base_query
+    /// Queries the database for a user with a certain `api_token` value.
+    pub fn find_by_api_token(conn: &PgConnection, token: &str) -> QueryResult<User> {
+        let api_token = ApiToken::find_by_api_token(conn, token)?;
+
+        Self::find(conn, api_token.user_id)
+    }
+
+    pub fn owning(krate: &Crate, conn: &PgConnection) -> QueryResult<Vec<Owner>> {
+        let users = CrateOwner::by_owner_kind(OwnerKind::User)
             .inner_join(users::table)
             .select(users::all_columns)
-            .filter(crate_owners::owner_kind.eq(OwnerKind::User as i32))
+            .filter(crate_owners::crate_id.eq(krate.id))
             .load(conn)?
             .into_iter()
             .map(Owner::User);
@@ -149,7 +136,7 @@ impl User {
     /// `Publish` as well, but this is a non-obvious invariant so we don't bother.
     /// Sweet free optimization if teams are proving burdensome to check.
     /// More than one team isn't really expected, though.
-    pub fn rights(&self, app: &App, owners: &[Owner]) -> CargoResult<Rights> {
+    pub fn rights(&self, app: &App, owners: &[Owner]) -> AppResult<Rights> {
         let mut best = Rights::None;
         for owner in owners {
             match *owner {
@@ -168,7 +155,9 @@ impl User {
         Ok(best)
     }
 
-    pub fn verified_email(&self, conn: &PgConnection) -> CargoResult<Option<String>> {
+    /// Queries the database for the verified emails
+    /// belonging to a given user
+    pub fn verified_email(&self, conn: &PgConnection) -> QueryResult<Option<String>> {
         Ok(Email::belonging_to(self)
             .select(emails::email)
             .filter(emails::verified.eq(true))
@@ -179,18 +168,19 @@ impl User {
     /// Converts this `User` model into an `EncodablePrivateUser` for JSON serialization.
     pub fn encodable_private(
         self,
+        email: Option<String>,
         email_verified: bool,
         email_verification_sent: bool,
     ) -> EncodablePrivateUser {
         let User {
             id,
-            email,
             name,
             gh_login,
             gh_avatar,
             ..
         } = self;
         let url = format!("https://github.com/{}", gh_login);
+
         EncodablePrivateUser {
             id,
             email,
@@ -201,6 +191,14 @@ impl User {
             name,
             url: Some(url),
         }
+    }
+
+    /// Queries for the email belonging to a particular user
+    pub fn email(&self, conn: &PgConnection) -> AppResult<Option<String>> {
+        Ok(Email::belonging_to(self)
+            .select(emails::email)
+            .first::<String>(&*conn)
+            .optional()?)
     }
 
     /// Converts this`User` model into an `EncodablePublicUser` for JSON serialization.

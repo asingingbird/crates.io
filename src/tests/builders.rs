@@ -3,7 +3,7 @@
 use cargo_registry::{
     models::{Crate, Keyword, NewCrate, NewVersion, Version},
     schema::{crates, dependencies, version_downloads, versions},
-    util::CargoResult,
+    util::errors::AppResult,
     views::krate_publish as u,
 };
 use std::{collections::HashMap, io::Read};
@@ -72,7 +72,7 @@ impl<'a> VersionBuilder<'a> {
         crate_id: i32,
         published_by: i32,
         connection: &PgConnection,
-    ) -> CargoResult<Version> {
+    ) -> AppResult<Version> {
         use diesel::{insert_into, update};
 
         let license = match self.license {
@@ -229,12 +229,12 @@ impl<'a> CrateBuilder<'a> {
         self
     }
 
-    fn build(mut self, connection: &PgConnection) -> CargoResult<Crate> {
+    fn build(mut self, connection: &PgConnection) -> AppResult<Crate> {
         use diesel::{insert_into, select, update};
 
         let mut krate = self
             .krate
-            .create_or_update(connection, None, self.owner_id, None)?;
+            .create_or_update(connection, self.owner_id, None)?;
 
         // Since we are using `NewCrate`, we can't set all the
         // crate properties in a single DB call.

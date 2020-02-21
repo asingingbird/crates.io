@@ -4,8 +4,9 @@
 //! index or cached metadata which was extracted (client side) from the
 //! `Cargo.toml` file.
 
-use crate::controllers::prelude::*;
+use crate::controllers::frontend_prelude::*;
 
+use crate::models::VersionOwnerAction;
 use crate::schema::*;
 use crate::views::{EncodableDependency, EncodablePublicUser, EncodableVersion};
 
@@ -18,9 +19,8 @@ use super::version_and_crate;
 /// In addition to returning cached data from the index, this returns
 /// fields for `id`, `version_id`, and `downloads` (which appears to always
 /// be 0)
-pub fn dependencies(req: &mut dyn Request) -> CargoResult<Response> {
-    let (version, _) = version_and_crate(req)?;
-    let conn = req.db_conn()?;
+pub fn dependencies(req: &mut dyn Request) -> AppResult<Response> {
+    let (conn, version, _) = version_and_crate(req)?;
     let deps = version.dependencies(&*conn)?;
     let deps = deps
         .into_iter()
@@ -35,9 +35,8 @@ pub fn dependencies(req: &mut dyn Request) -> CargoResult<Response> {
 }
 
 /// Handles the `GET /crates/:crate_id/:version/authors` route.
-pub fn authors(req: &mut dyn Request) -> CargoResult<Response> {
-    let (version, _) = version_and_crate(req)?;
-    let conn = req.db_conn()?;
+pub fn authors(req: &mut dyn Request) -> AppResult<Response> {
+    let (conn, version, _) = version_and_crate(req)?;
     let names = version_authors::table
         .filter(version_authors::version_id.eq(version.id))
         .select(version_authors::name)
@@ -66,16 +65,16 @@ pub fn authors(req: &mut dyn Request) -> CargoResult<Response> {
 ///
 /// The frontend doesn't appear to hit this endpoint, but our tests do, and it seems to be a useful
 /// API route to have.
-pub fn show(req: &mut dyn Request) -> CargoResult<Response> {
-    let (version, krate) = version_and_crate(req)?;
-    let conn = req.db_conn()?;
+pub fn show(req: &mut dyn Request) -> AppResult<Response> {
+    let (conn, version, krate) = version_and_crate(req)?;
     let published_by = version.published_by(&conn);
+    let actions = VersionOwnerAction::by_version(&conn, &version)?;
 
     #[derive(Serialize)]
     struct R {
         version: EncodableVersion,
     }
     Ok(req.json(&R {
-        version: version.encodable(&krate.name, published_by),
+        version: version.encodable(&krate.name, published_by, actions),
     }))
 }

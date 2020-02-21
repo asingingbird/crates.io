@@ -1,20 +1,24 @@
 mod prelude {
     pub use conduit::{Handler, Request, Response};
     pub use conduit_middleware::{AroundMiddleware, Middleware};
-    pub use std::error::Error;
+
+    use std::error::Error;
+    pub type BoxError = Box<dyn Error + Send>;
+    pub type Result<T> = std::result::Result<T, BoxError>;
 }
 
-pub use self::app::AppMiddleware;
-pub use self::current_user::CurrentUser;
-pub use self::debug::*;
-pub use self::ember_index_rewrite::EmberIndexRewrite;
-pub use self::head::Head;
+pub use prelude::Result;
+
+use self::app::AppMiddleware;
+use self::current_user::CaptureUserIdFromCookie;
+use self::debug::*;
+use self::ember_index_rewrite::EmberIndexRewrite;
+use self::head::Head;
 use self::log_connection_pool_status::LogConnectionPoolStatus;
-pub use self::security_headers::SecurityHeaders;
-pub use self::static_or_continue::StaticOrContinue;
+use self::static_or_continue::StaticOrContinue;
 
 pub mod app;
-mod block_ips;
+mod block_traffic;
 pub mod current_user;
 mod debug;
 mod ember_index_rewrite;
@@ -23,7 +27,6 @@ mod head;
 mod log_connection_pool_status;
 mod log_request;
 mod require_user_agent;
-mod security_headers;
 mod static_or_continue;
 
 use conduit_conditional_get::ConditionalGet;
@@ -38,7 +41,8 @@ use crate::{App, Env};
 
 pub fn build_middleware(app: Arc<App>, endpoints: R404) -> MiddlewareBuilder {
     let mut m = MiddlewareBuilder::new(endpoints);
-    let env = app.config.env;
+    let config = app.config.clone();
+    let env = config.env;
 
     if env != Env::Test {
         m.add(ensure_well_formed_500::EnsureWellFormed500);
@@ -68,13 +72,10 @@ pub fn build_middleware(app: Arc<App>, endpoints: R404) -> MiddlewareBuilder {
         env == Env::Production,
     ));
 
-    if env == Env::Production {
-        m.add(SecurityHeaders::new(&app.config.uploader));
-    }
     m.add(AppMiddleware::new(app));
 
-    // Sets the current user on each request.
-    m.add(CurrentUser);
+    // Parse and save the user_id from the session cookie as part of the authentication logic
+    m.add(CaptureUserIdFromCookie);
 
     // Serve the static files in the *dist* directory, which are the frontend assets.
     // Not needed for the backend tests.
@@ -87,9 +88,8 @@ pub fn build_middleware(app: Arc<App>, endpoints: R404) -> MiddlewareBuilder {
 
     m.around(Head::default());
 
-    if let Ok(ip_list) = env::var("BLOCKED_IPS") {
-        let ips = ip_list.split(',').map(String::from).collect();
-        m.around(block_ips::BlockIps::new(ips));
+    for (header, blocked_values) in config.blocked_traffic {
+        m.around(block_traffic::BlockTraffic::new(header, blocked_values));
     }
 
     m.around(require_user_agent::RequireUserAgent::default());

@@ -26,7 +26,8 @@ use crate::{
 use cargo_registry::{
     background_jobs::Environment,
     db::DieselPool,
-    middleware::current_user::AuthenticationSource,
+    git::{Credentials, RepositoryConfig},
+    middleware::current_user::TrustedUserId,
     models::{ApiToken, User},
     App, Config,
 };
@@ -39,6 +40,8 @@ use conduit_test::MockRequest;
 
 use cargo_registry::git::Repository as WorkerRepository;
 use git2::Repository as UpstreamRepository;
+
+use url::Url;
 
 struct TestAppInner {
     app: Arc<App>,
@@ -76,7 +79,7 @@ impl Drop for TestAppInner {
 
         // Manually verify that all jobs have completed successfully
         // This will catch any tests that enqueued a job but forgot to initialize the runner
-        let conn = self.app.diesel_database.get().unwrap();
+        let conn = self.app.primary_database.get().unwrap();
         let job_count: i64 = background_jobs.count().get_result(&*conn).unwrap();
         assert_eq!(
             0, job_count,
@@ -119,7 +122,7 @@ impl TestApp {
     /// connection before making any API calls.  Once the closure returns, the connection is
     /// dropped, ensuring it is returned to the pool and available for any future API calls.
     pub fn db<T, F: FnOnce(&PgConnection) -> T>(&self, f: F) -> T {
-        let conn = self.0.app.diesel_database.get().unwrap();
+        let conn = self.0.app.primary_database.get().unwrap();
         f(&conn)
     }
 
@@ -132,9 +135,11 @@ impl TestApp {
         use diesel::prelude::*;
 
         let user = self.db(|conn| {
-            let mut user = crate::new_user(username).create_or_update(conn).unwrap();
             let email = "something@example.com";
-            user.email = Some(email.to_string());
+
+            let user = crate::new_user(username)
+                .create_or_update(None, conn)
+                .unwrap();
             diesel::insert_into(emails::table)
                 .values((
                     emails::user_id.eq(user.id),
@@ -190,7 +195,12 @@ impl TestApp {
 
     /// Obtain a reference to the inner `App` value
     pub fn as_inner(&self) -> &App {
-        &*self.0.app
+        &self.0.app
+    }
+
+    /// Obtain a reference to the inner middleware builder
+    pub fn as_middleware(&self) -> &conduit_middleware::MiddlewareBuilder {
+        &self.0.middle
     }
 }
 
@@ -205,15 +215,19 @@ pub struct TestAppBuilder {
 impl TestAppBuilder {
     /// Create a `TestApp` with an empty database
     pub fn empty(self) -> (TestApp, MockAnonymousUser) {
+        use crate::git;
+
         let (app, middle) = crate::build_app(self.config, self.proxy);
 
         let runner = if self.build_job_runner {
-            let connection_pool = app.diesel_database.clone();
-            let index =
-                WorkerRepository::open(&app.config.index_location).expect("Could not clone index");
+            let connection_pool = app.primary_database.clone();
+            let repository_config = RepositoryConfig {
+                index_location: Url::from_file_path(&git::bare()).unwrap(),
+                credentials: Credentials::Missing,
+            };
+            let index = WorkerRepository::open(&repository_config).expect("Could not clone index");
             let environment = Environment::new(
                 index,
-                None,
                 connection_pool.clone(),
                 app.config.uploader.clone(),
                 app.http_client().clone(),
@@ -224,7 +238,7 @@ impl TestAppBuilder {
                     // We only have 1 connection in tests, so trying to run more than
                     // 1 job concurrently will just block
                     .thread_count(1)
-                    .job_start_timeout(Duration::from_secs(1))
+                    .job_start_timeout(Duration::from_secs(5))
                     .build(),
             )
         } else {
@@ -268,10 +282,16 @@ impl TestAppBuilder {
         (app, anon, user, token)
     }
 
-    pub fn with_publish_rate_limit(mut self, rate: Duration, burst: i32) -> Self {
-        self.config.publish_rate_limit.rate = rate;
-        self.config.publish_rate_limit.burst = burst;
+    pub fn with_config(mut self, f: impl FnOnce(&mut Config)) -> Self {
+        f(&mut self.config);
         self
+    }
+
+    pub fn with_publish_rate_limit(self, rate: Duration, burst: i32) -> Self {
+        self.with_config(|config| {
+            config.publish_rate_limit.rate = rate;
+            config.publish_rate_limit.burst = burst;
+        })
     }
 
     pub fn with_git_index(mut self) -> Self {
@@ -290,7 +310,7 @@ impl TestAppBuilder {
     }
 }
 
-/// A colleciton of helper methods for the 3 authentication types
+/// A collection of helper methods for the 3 authentication types
 ///
 /// Helper methods go through public APIs, and should not modify the database directly
 pub trait RequestHelper {
@@ -302,7 +322,7 @@ pub trait RequestHelper {
     where
         T: serde::de::DeserializeOwned,
     {
-        Response::new(self.app().0.middle.call(&mut request))
+        Response::new(self.app().as_middleware().call(&mut request))
     }
 
     /// Issue a GET request
@@ -423,8 +443,8 @@ impl RequestHelper for MockAnonymousUser {
 
 /// A type that can generate cookie authenticated requests
 ///
-/// The `User` is directly injected into middleware extensions and thus the cookie logic is not
-/// exercised.
+/// The `user.id` value is directly injected into a request extension and thus the conduit_cookie
+/// session logic is not exercised.
 pub struct MockCookieUser {
     app: TestApp,
     user: User,
@@ -433,10 +453,8 @@ pub struct MockCookieUser {
 impl RequestHelper for MockCookieUser {
     fn request_builder(&self, method: Method, path: &str) -> MockRequest {
         let mut request = crate::req(method, path);
-        request.mut_extensions().insert(self.user.clone());
-        request
-            .mut_extensions()
-            .insert(AuthenticationSource::SessionCookie);
+        let id = TrustedUserId(self.user.id);
+        request.mut_extensions().insert(id);
         request
     }
 
@@ -523,7 +541,7 @@ impl MockTokenUser {
     {
         let url = format!("/api/v1/crates/{}/owners", krate_name);
         let body = json!({ "owners": owners }).to_string();
-        method(&self, &url, body.to_string().as_bytes())
+        method(&self, &url, body.as_bytes())
     }
 
     /// Add a user as an owner for a crate.

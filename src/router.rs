@@ -1,13 +1,12 @@
-use std::error::Error;
 use std::sync::Arc;
 
 use conduit::{Handler, Request, Response};
 use conduit_router::{RequestParams, RouteBuilder};
 
 use crate::controllers::*;
-use crate::util::errors::{std_error, CargoError, CargoResult, NotFound};
+use crate::util::errors::{std_error, AppError, AppResult, NotFound};
 use crate::util::RequestProxy;
-use crate::{App, Env};
+use crate::{middleware, App, Env};
 
 pub fn build_router(app: &App) -> R404 {
     let mut api_router = RouteBuilder::new();
@@ -89,6 +88,14 @@ pub fn build_router(app: &App) -> R404 {
         "/me/crate_owner_invitations/:crate_id",
         C(crate_owner_invitation::handle_invite),
     );
+    api_router.put(
+        "/me/crate_owner_invitations/accept/:token",
+        C(crate_owner_invitation::handle_invite_with_token),
+    );
+    api_router.put(
+        "/me/email_notifications",
+        C(user::me::update_email_notifications),
+    );
     api_router.get("/summary", C(krate::metadata::summary));
     api_router.put("/confirm/:email_token", C(user::me::confirm_user_email));
     api_router.put(
@@ -108,9 +115,13 @@ pub fn build_router(app: &App) -> R404 {
     router.head("/api/v1/*path", R(Arc::clone(&api_router)));
     router.delete("/api/v1/*path", R(api_router));
 
-    router.get("/authorize_url", C(user::session::github_authorize));
-    router.get("/authorize", C(user::session::github_access_token));
-    router.delete("/logout", C(user::session::logout));
+    // Session management
+    router.get("/api/private/session/begin", C(user::session::begin));
+    router.get(
+        "/api/private/session/authorize",
+        C(user::session::authorize),
+    );
+    router.delete("/api/private/session", C(user::session::logout));
 
     // Only serve the local checkout of the git index in development mode.
     // In production, for crates.io, cargo gets the index from
@@ -125,10 +136,10 @@ pub fn build_router(app: &App) -> R404 {
     R404(router)
 }
 
-struct C(pub fn(&mut dyn Request) -> CargoResult<Response>);
+struct C(pub fn(&mut dyn Request) -> AppResult<Response>);
 
 impl Handler for C {
-    fn call(&self, req: &mut dyn Request) -> Result<Response, Box<dyn Error + Send>> {
+    fn call(&self, req: &mut dyn Request) -> middleware::Result<Response> {
         let C(f) = *self;
         match f(req) {
             Ok(resp) => Ok(resp),
@@ -143,7 +154,7 @@ impl Handler for C {
 struct R<H>(pub Arc<H>);
 
 impl<H: Handler> Handler for R<H> {
-    fn call(&self, req: &mut dyn Request) -> Result<Response, Box<dyn Error + Send>> {
+    fn call(&self, req: &mut dyn Request) -> middleware::Result<Response> {
         let path = req.params()["path"].to_string();
         let R(ref sub_router) = *self;
         sub_router.call(&mut RequestProxy::rewrite_path(req, &path))
@@ -155,7 +166,7 @@ impl<H: Handler> Handler for R<H> {
 pub struct R404(pub RouteBuilder);
 
 impl Handler for R404 {
-    fn call(&self, req: &mut dyn Request) -> Result<Response, Box<dyn Error + Send>> {
+    fn call(&self, req: &mut dyn Request) -> middleware::Result<Response> {
         let R404(ref router) = *self;
         match router.recognize(&req.method(), req.path()) {
             Ok(m) => {
@@ -170,12 +181,12 @@ impl Handler for R404 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::errors::{bad_request, human, internal, NotFound, Unauthorized};
+    use crate::util::errors::{bad_request, cargo_err, internal, AppError, NotFound, Unauthorized};
 
     use conduit_test::MockRequest;
     use diesel::result::Error as DieselError;
 
-    fn err<E: CargoError>(err: E) -> CargoResult<Response> {
+    fn err<E: AppError>(err: E) -> AppResult<Response> {
         Err(Box::new(err))
     }
 
@@ -202,18 +213,19 @@ mod tests {
         );
         assert_eq!(C(|_| err(NotFound)).call(&mut req).unwrap().status.0, 404);
 
-        // Human errors are returned as 200 so that cargo displays this nicely on the command line
-        assert_eq!(C(|_| Err(human(""))).call(&mut req).unwrap().status.0, 200);
+        // cargo_err errors are returned as 200 so that cargo displays this nicely on the command line
+        assert_eq!(
+            C(|_| Err(cargo_err(""))).call(&mut req).unwrap().status.0,
+            200
+        );
 
         // All other error types are propogated up the middleware, eventually becoming status 500
         assert!(C(|_| Err(internal(""))).call(&mut req).is_err());
-        assert!(C(|_| err(::serde_json::Error::syntax(
-            ::serde_json::error::ErrorCode::ExpectedColon,
-            0,
-            0
-        )))
-        .call(&mut req)
-        .is_err());
+        assert!(
+            C(|_| err::<::serde_json::Error>(::serde::de::Error::custom("ExpectedColon")))
+                .call(&mut req)
+                .is_err()
+        );
         assert!(
             C(|_| err(::std::io::Error::new(::std::io::ErrorKind::Other, "")))
                 .call(&mut req)

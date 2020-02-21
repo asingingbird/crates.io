@@ -4,7 +4,7 @@ use ammonia::{Builder, UrlRelative, UrlRelativeEvaluate};
 use htmlescape::encode_minimal;
 use std::borrow::Cow;
 use std::path::Path;
-use swirl::errors::PerformError;
+use swirl::PerformError;
 use url::Url;
 
 use crate::background_jobs::Environment;
@@ -22,52 +22,6 @@ impl<'a> MarkdownRenderer<'a> {
     /// Per `readme_to_html`, `base_url` is the base URL prepended to any
     /// relative links in the input document.  See that function for more detail.
     fn new(base_url: Option<&'a str>) -> MarkdownRenderer<'a> {
-        let tags = hashset(&[
-            "a",
-            "b",
-            "blockquote",
-            "br",
-            "code",
-            "dd",
-            "del",
-            "dl",
-            "dt",
-            "em",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            "hr",
-            "i",
-            "img",
-            "input",
-            "kbd",
-            "li",
-            "ol",
-            "p",
-            "pre",
-            "s",
-            "strike",
-            "strong",
-            "sub",
-            "sup",
-            "table",
-            "tbody",
-            "td",
-            "th",
-            "thead",
-            "tr",
-            "ul",
-            "hr",
-            "span",
-        ]);
-        let tag_attributes = hashmap(&[
-            ("a", hashset(&["href", "id", "target"])),
-            ("img", hashset(&["width", "height", "src", "alt", "align"])),
-            ("input", hashset(&["checked", "disabled", "type"])),
-        ]);
         let allowed_classes = hashmap(&[(
             "code",
             hashset(&[
@@ -89,11 +43,12 @@ impl<'a> MarkdownRenderer<'a> {
         )]);
         let sanitize_url = UrlRelative::Custom(Box::new(SanitizeUrl::new(base_url)));
 
-        let mut html_sanitizer = Builder::new();
+        let mut html_sanitizer = Builder::default();
         html_sanitizer
+            .add_tags(&["input"])
             .link_rel(Some("nofollow noopener noreferrer"))
-            .tags(tags)
-            .tag_attributes(tag_attributes)
+            .add_tag_attributes("a", &["id", "target"])
+            .add_tag_attributes("input", &["checked", "disabled", "type"])
             .allowed_classes(allowed_classes)
             .url_relative(sanitize_url)
             .id_prefix(Some("user-content-"));
@@ -148,15 +103,39 @@ impl SanitizeUrl {
     }
 }
 
+/// Groups media-related URL info
+struct MediaUrl {
+    is_media: bool,
+    add_sanitize_query: bool,
+}
+
 /// Determine whether the given URL has a media file externsion.
-fn is_media_url(url: &str) -> bool {
+/// Also check if `sanitize=true` must be added to the query string,
+/// which is required to load SVGs properly from GitHub.
+fn is_media_url(url: &str) -> MediaUrl {
     Path::new(url)
         .extension()
         .and_then(std::ffi::OsStr::to_str)
-        .map_or(false, |e| match e {
-            "png" | "svg" | "jpg" | "jpeg" | "gif" | "mp4" | "webm" | "ogg" => true,
-            _ => false,
-        })
+        .map_or(
+            MediaUrl {
+                is_media: false,
+                add_sanitize_query: false,
+            },
+            |e| match e {
+                "svg" => MediaUrl {
+                    is_media: true,
+                    add_sanitize_query: true,
+                },
+                "png" | "jpg" | "jpeg" | "gif" | "mp4" | "webm" | "ogg" => MediaUrl {
+                    is_media: true,
+                    add_sanitize_query: false,
+                },
+                _ => MediaUrl {
+                    is_media: false,
+                    add_sanitize_query: false,
+                },
+            },
+        )
 }
 
 impl UrlRelativeEvaluate for SanitizeUrl {
@@ -169,7 +148,11 @@ impl UrlRelativeEvaluate for SanitizeUrl {
             let mut new_url = base_url.clone();
             // Assumes GitHub’s URL scheme. GitHub renders text and markdown
             // better in the "blob" view, but images need to be served raw.
-            new_url += if is_media_url(url) {
+            let MediaUrl {
+                is_media,
+                add_sanitize_query,
+            } = is_media_url(url);
+            new_url += if is_media {
                 "raw/master"
             } else {
                 "blob/master"
@@ -178,6 +161,12 @@ impl UrlRelativeEvaluate for SanitizeUrl {
                 new_url.push('/');
             }
             new_url += url;
+            if add_sanitize_query {
+                if let Ok(mut parsed_url) = Url::parse(&new_url) {
+                    parsed_url.query_pairs_mut().append_pair("sanitize", "true");
+                    new_url = parsed_url.into_string();
+                }
+            }
             Cow::Owned(new_url)
         })
     }
@@ -240,10 +229,9 @@ pub fn render_and_upload_readme(
     base_url: Option<String>,
 ) -> Result<(), PerformError> {
     use crate::schema::*;
-    use crate::util::errors::std_error_no_send;
     use diesel::prelude::*;
 
-    let rendered = readme_to_html(&text, &file_name, base_url.as_ref().map(String::as_str));
+    let rendered = readme_to_html(&text, &file_name, base_url.as_deref());
     let conn = env.connection()?;
 
     conn.transaction(|| {
@@ -254,8 +242,7 @@ pub fn render_and_upload_readme(
             .select((crates::name, versions::num))
             .first::<(String, String)>(&*conn)?;
         env.uploader
-            .upload_readme(env.http_client(), &crate_name, &vers, rendered)
-            .map_err(std_error_no_send)?;
+            .upload_readme(env.http_client(), &crate_name, &vers, rendered)?;
         Ok(())
     })
 }
@@ -317,8 +304,7 @@ mod tests {
 
     #[test]
     fn text_with_inline_javascript() {
-        let text =
-            r#"foo_readme\n\n<a href="https://crates.io/crates/cargo-registry" onclick="window.alert('Got you')">Crate page</a>"#;
+        let text = r#"foo_readme\n\n<a href="https://crates.io/crates/cargo-registry" onclick="window.alert('Got you')">Crate page</a>"#;
         let result = markdown_to_html(text, None);
         assert_eq!(
             result,
@@ -356,6 +342,7 @@ mod tests {
         let absolute = "[hi](/hi)";
         let relative = "[there](there)";
         let image = "![alt](img.png)";
+        let svg = "![alt](sanitize.svg)";
 
         for host in &["github.com", "gitlab.com", "bitbucket.org"] {
             for (&extra_slash, &dot_git) in [true, false].iter().zip(&[true, false]) {
@@ -389,6 +376,15 @@ mod tests {
                     result,
                     format!(
                  "<p><img src=\"https://{}/rust-lang/test/raw/master/img.png\" alt=\"alt\"></p>\n",
+                        host
+                    )
+                );
+
+                let result = markdown_to_html(svg, Some(&url));
+                assert_eq!(
+                    result,
+                    format!(
+                        "<p><img src=\"https://{}/rust-lang/test/raw/master/sanitize.svg?sanitize=true\" alt=\"alt\"></p>\n",
                         host
                     )
                 );
@@ -453,6 +449,16 @@ mod tests {
         assert_eq!(
             result,
             "<h1><a href=\"#my-crate\" id=\"user-content-my-crate\" rel=\"nofollow noopener noreferrer\"></a>My crate</h1>\n<p>Hello, world!</p>\n"
+        );
+    }
+
+    #[test]
+    fn tables_with_rowspan_and_colspan() {
+        let text = "<table><tr><th rowspan=\"1\" colspan=\"2\">Target</th></tr></table>\n";
+        let result = markdown_to_html(text, None);
+        assert_eq!(
+            result,
+            "<table><tbody><tr><th rowspan=\"1\" colspan=\"2\">Target</th></tr></tbody></table>\n"
         );
     }
 }

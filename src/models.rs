@@ -1,3 +1,4 @@
+pub use self::action::{insert_version_owner_action, VersionAction, VersionOwnerAction};
 pub use self::badge::{Badge, CrateBadge, MaintenanceStatus};
 pub use self::category::{Category, CrateCategory, NewCategory};
 pub use self::crate_owner_invitation::{CrateOwnerInvitation, NewCrateOwnerInvitation};
@@ -16,6 +17,7 @@ pub use self::version::{NewVersion, Version};
 
 pub mod helpers;
 
+mod action;
 mod badge;
 pub mod category;
 mod crate_owner_invitation;
@@ -29,5 +31,5 @@ mod owner;
 mod rights;
 mod team;
 mod token;
-mod user;
+pub mod user;
 mod version;

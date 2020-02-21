@@ -1,10 +1,4 @@
-#![deny(warnings, clippy::all, rust_2018_idioms)]
-// TODO: Remove after we can bump to Rust 1.35 stable in `RustConfig`
-#![allow(
-    renamed_and_removed_lints,
-    clippy::cyclomatic_complexity,
-    clippy::unknown_clippy_lints
-)]
+#![warn(clippy::all, rust_2018_idioms)]
 
 #[macro_use]
 extern crate diesel;
@@ -19,7 +13,6 @@ use crate::util::{Bad, RequestHelper, TestApp};
 use cargo_registry::{
     models::{Crate, CrateOwner, Dependency, NewCategory, NewTeam, NewUser, Team, User, Version},
     schema::crate_owners,
-    util::CargoResult,
     views::{
         EncodableCategory, EncodableCategoryWithSubcategories, EncodableCrate, EncodableKeyword,
         EncodableOwner, EncodableVersion, GoodCrate,
@@ -36,8 +29,7 @@ use std::{
 
 use conduit_test::MockRequest;
 use diesel::prelude::*;
-use reqwest::{Client, Proxy};
-use url::Url;
+use reqwest::{blocking::Client, Proxy};
 
 macro_rules! t {
     ($e:expr) => {
@@ -48,10 +40,12 @@ macro_rules! t {
     };
 }
 
+mod authentication;
 mod badge;
 mod builders;
 mod categories;
 mod category;
+mod dump_db;
 mod git;
 mod keyword;
 mod krate;
@@ -136,10 +130,10 @@ fn simple_config() -> Config {
         uploader,
         session_key: "test this has to be over 32 bytes long".to_string(),
         git_repo_checkout: git::checkout(),
-        index_location: Url::from_file_path(&git::bare()).unwrap(),
         gh_client_id: dotenv::var("GH_CLIENT_ID").unwrap_or_default(),
         gh_client_secret: dotenv::var("GH_CLIENT_SECRET").unwrap_or_default(),
         db_url: env("TEST_DATABASE_URL"),
+        replica_db_url: None,
         env: Env::Test,
         max_upload_size: 3000,
         max_unpack_size: 2000,
@@ -148,6 +142,7 @@ fn simple_config() -> Config {
         // sniff/record it, but everywhere else we use https
         api_protocol: String::from("http"),
         publish_rate_limit: Default::default(),
+        blocked_traffic: Default::default(),
     }
 }
 
@@ -165,7 +160,7 @@ fn build_app(
     };
 
     let app = App::new(&config, client);
-    t!(t!(app.diesel_database.get()).begin_test_transaction());
+    t!(t!(app.primary_database.get()).begin_test_transaction());
     let app = Arc::new(app);
     let handler = cargo_registry::build_handler(Arc::clone(&app));
     (app, handler)
@@ -220,7 +215,6 @@ fn new_user(login: &str) -> NewUser<'_> {
     NewUser {
         gh_id: NEXT_GH_ID.fetch_add(1, Ordering::SeqCst) as i32,
         gh_login: login,
-        email: None,
         name: None,
         gh_avatar: None,
         gh_access_token: Cow::Borrowed("some random token"),
@@ -236,12 +230,13 @@ fn new_team(login: &str) -> NewTeam<'_> {
     }
 }
 
-fn add_team_to_crate(t: &Team, krate: &Crate, u: &User, conn: &PgConnection) -> CargoResult<()> {
+fn add_team_to_crate(t: &Team, krate: &Crate, u: &User, conn: &PgConnection) -> QueryResult<()> {
     let crate_owner = CrateOwner {
         crate_id: krate.id,
         owner_id: t.id,
         created_by: u.id,
         owner_kind: 1, // Team owner kind is 1 according to owner.rs
+        email_notifications: true,
     };
 
     diesel::insert_into(crate_owners::table)
@@ -284,8 +279,8 @@ fn multiple_live_references_to_the_same_connection_can_be_checked_out() {
     use std::ptr;
 
     let (app, _) = app();
-    let conn1 = app.diesel_database.get().unwrap();
-    let conn2 = app.diesel_database.get().unwrap();
+    let conn1 = app.primary_database.get().unwrap();
+    let conn2 = app.primary_database.get().unwrap();
     let conn1_ref: &PgConnection = &conn1;
     let conn2_ref: &PgConnection = &conn2;
 

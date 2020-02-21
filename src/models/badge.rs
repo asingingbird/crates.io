@@ -68,6 +68,10 @@ pub enum Badge {
         branch: Option<String>,
         service: Option<String>,
     },
+    BitbucketPipelines {
+        repository: String,
+        branch: String,
+    },
     Maintenance {
         status: MaintenanceStatus,
     },
@@ -105,6 +109,7 @@ impl Queryable<badges::SqlType, Pg> for Badge {
 
 impl Badge {
     pub fn encodable(self) -> EncodableBadge {
+        // The serde attributes on Badge ensure it can be deserialized to EncodableBadge
         serde_json::from_value(serde_json::to_value(self).unwrap()).unwrap()
     }
 

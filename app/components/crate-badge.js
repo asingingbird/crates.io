@@ -2,19 +2,17 @@ import Component from '@ember/component';
 import { computed } from '@ember/object';
 
 export default Component.extend({
-    classNames: ['vers'],
+  tagName: '',
 
-    tagName: 'span',
+  version: computed('crate.max_version', function() {
+    return this.get('crate.max_version').replace('-', '--');
+  }),
 
-    version: computed('crate.max_version', function() {
-        return this.get('crate.max_version').replace('-', '--');
-    }),
-
-    color: computed('crate.max_version', function() {
-        if (this.get('crate.max_version')[0] == '0') {
-            return 'orange';
-        } else {
-            return 'blue';
-        }
-    }),
+  color: computed('crate.max_version', function() {
+    if (this.get('crate.max_version')[0] == '0') {
+      return 'orange';
+    } else {
+      return 'blue';
+    }
+  }),
 });

@@ -26,22 +26,23 @@ like to see all new types and functions, public and private, to have documentati
 comments on them. If you change an existing type or function, and it doesn't have
 a documentation comment on it, it'd be great if you could add one to it too.
 
-When you submit a pull request, it will be automatically tested on TravisCI. In
+When you submit a pull request, it will be automatically tested on GitHub Actions. In
 addition to running both the frontend and the backend tests described below,
-Travis runs [jslint], [clippy], and [rustfmt] on each PR.
+GitHub Actions runs [jslint], [clippy], and [rustfmt] on each PR.
 
-If you don't want to run these tools locally, please watch the Travis results
+If you don't want to run these tools locally, please watch the GitHub Actions results
 and submit additional commits to your pull request to fix any issues they find!
 
 If you do want to run these tools locally in order to fix issues before
 submitting, that would be great too! Please consult each tool's installation
-instructions and the .travis.yml file in this repository for the latest
-installation and running instructions. The logs for recent builds in Travis
+instructions and the [.github/workflows/ci.yml] file in this repository for the latest
+installation and running instructions. The logs for recent builds in GitHub Actions
 may also be helpful to see which versions of these tools we're currently using.
 
 [jslint]: http://jslint.com/
 [clippy]: https://github.com/rust-lang-nursery/rust-clippy
 [rustfmt]: https://github.com/rust-lang-nursery/rustfmt
+[.github/workflows/ci.yml]: /.github/workflows/ci.yml
 
 We will try to review your pull requests as soon as possible!
 
@@ -86,8 +87,8 @@ as well.
 
 In order to run the frontend on Windows and macOS, you will need to have installed:
 
-- [node](https://nodejs.org/en/) >= 6.10.0 (see .travis.yml for what we currently use)
-- [npm](https://www.npmjs.com/get-npm) >= 4.0.0
+- [node](https://nodejs.org/en/) >= 12.9.1 (see `package.json` and `.github/workflows/ci.yml` for what we currently use)
+- [npm](https://www.npmjs.com/get-npm) >= 6.10.2
 
 Follow the links for each of these tools for their recommended installation
 instructions. If you already have these tools, or you have a different
@@ -186,6 +187,20 @@ methods we'd recommend for each operating system:
 
 Then, once Postgres is installed, ensure that you can run `psql` (and then exit
 by typing `\q`) without any errors to connect to your running Postgres server.
+
+> If you see an error that looks like this:
+>
+> ```
+> psql: could not connect to server: No such file or directory
+> Is the server running locally and accepting
+> connections on Unix domain socket "/var/run/postgresql/.s.PGSQL.5432"?  
+> ```
+> You may need to start the postgreql server on your system. On a Linux system,
+> you can start it with this command:
+>
+> ```
+> sudo service postgresql start
+> ```
 
 > Depending on your system, its permissions, and how Postgres was installed, you
 > may need to use the `postgres` user for some operations (by using `sudo su -
@@ -288,6 +303,18 @@ Try using `postgres://postgres@localhost/cargo_registry` first.
 >   We're going to create a database named `cargo_registry` in the next
 >   section; change this if you'd like to name it something else.
 
+
+> If you receive an error that looks like:
+>
+> ```
+> password authentication failed for user \"postgres\"\nFATAL:  
+> password authentication failed for user \"postgres\"\n"` 
+> ```
+>
+> You may need to update the pg_hba.conf file on your development workstation.
+> For a guide to finding your pg_hba.conf file, check out [this post](https://askubuntu.com/questions/256534/how-do-i-find-the-path-to-pg-hba-conf-from-the-shell) on the Ubuntu Stack Exchange.
+> For information on updating your pg_hba.conf file and reloading it, see [this post](https://stackoverflow.com/questions/17996957/fe-sendauth-no-password-supplied) on Stack Overflow.
+
 ##### Creating the database
 
 You can name your development database anything as long as it matches the
@@ -344,8 +371,7 @@ Mailgun environment variables in `.env` manually or run your app instance
 on Heroku and add the Mailgun app.
 
 To set the environment variables manually, create an account and configure
-Mailgun. [These quick start instructions]
-(http://mailgun-documentation.readthedocs.io/en/latest/quickstart.html)
+Mailgun. [These quick start instructions](https://documentation.mailgun.com/en/latest/quickstart.html)
 might be helpful. Once you get the environment variables for the app, you
 will have to add them to the bottom of the `.env` file. You will need to
 fill in the `MAILGUN_SMTP_LOGIN`, `MAILGUN_SMTP_PASSWORD`, and

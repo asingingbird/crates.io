@@ -86,7 +86,7 @@ fn index() {
     assert_eq!(json.meta.total, 0);
 
     let krate = app.db(|conn| {
-        let u = new_user("foo").create_or_update(conn).unwrap();
+        let u = new_user("foo").create_or_update(None, conn).unwrap();
         CrateBuilder::new("fooindex", u.id).expect_build(conn)
     });
 
@@ -117,6 +117,11 @@ fn index_queries() {
         CrateBuilder::new("foo", user.id)
             .keyword("kw3")
             .expect_build(conn);
+
+        CrateBuilder::new("two-keywords", user.id)
+            .keyword("kw1")
+            .keyword("kw3")
+            .expect_build(conn);
         (krate, krate2)
     });
 
@@ -124,11 +129,11 @@ fn index_queries() {
 
     // All of these fields should be indexed/searched by the queries
     assert_eq!(anon.search("q=foo").meta.total, 2);
-    assert_eq!(anon.search("q=kw1").meta.total, 2);
+    assert_eq!(anon.search("q=kw1").meta.total, 3);
     assert_eq!(anon.search("q=readme").meta.total, 1);
     assert_eq!(anon.search("q=description").meta.total, 1);
 
-    assert_eq!(anon.search_by_user_id(user.id).crates.len(), 3);
+    assert_eq!(anon.search_by_user_id(user.id).crates.len(), 4);
     assert_eq!(anon.search_by_user_id(0).crates.len(), 0);
 
     assert_eq!(anon.search("letter=F").crates.len(), 2);
@@ -136,9 +141,10 @@ fn index_queries() {
     assert_eq!(anon.search("letter=b").crates.len(), 1);
     assert_eq!(anon.search("letter=c").crates.len(), 0);
 
-    assert_eq!(anon.search("keyword=kw1").crates.len(), 2);
-    assert_eq!(anon.search("keyword=KW1").crates.len(), 2);
+    assert_eq!(anon.search("keyword=kw1").crates.len(), 3);
+    assert_eq!(anon.search("keyword=KW1").crates.len(), 3);
     assert_eq!(anon.search("keyword=kw2").crates.len(), 0);
+    assert_eq!(anon.search("all_keywords=kw1 kw3").crates.len(), 1);
 
     assert_eq!(anon.search("q=foo&keyword=kw1").crates.len(), 1);
     assert_eq!(anon.search("q=foo2&keyword=kw1").crates.len(), 0);
@@ -1243,6 +1249,12 @@ fn summary_new_crates() {
 
         let krate3 = CrateBuilder::new("just_updated", user.id)
             .version(VersionBuilder::new("0.1.0"))
+            .version(VersionBuilder::new("0.1.2"))
+            .expect_build(conn);
+
+        let krate4 = CrateBuilder::new("just_updated_patch", user.id)
+            .version(VersionBuilder::new("0.1.0"))
+            .version(VersionBuilder::new("0.2.0"))
             .expect_build(conn);
 
         CrateBuilder::new("with_downloads", user.id)
@@ -1269,11 +1281,25 @@ fn summary_new_crates() {
             .set(crates::updated_at.eq(updated))
             .execute(&*conn)
             .unwrap();
+
+        let plus_two = Utc::now().naive_utc() + chrono::Duration::seconds(2);
+        let newer = VersionBuilder::new("0.1.1").expect_build(krate4.id, user.id, conn);
+
+        // Update the patch version to be newer than the other versions, including the higher one.
+        update(&newer)
+            .set(versions::created_at.eq(plus_two))
+            .execute(&*conn)
+            .unwrap();
+
+        update(&krate4)
+            .set(crates::updated_at.eq(plus_two))
+            .execute(&*conn)
+            .unwrap();
     });
 
     let json: SummaryResponse = anon.get("/api/v1/summary").good();
 
-    assert_eq!(json.num_crates, 4);
+    assert_eq!(json.num_crates, 5);
     assert_eq!(json.num_downloads, 6000);
     assert_eq!(json.most_downloaded[0].name, "most_recent_downloads");
     assert_eq!(
@@ -1282,9 +1308,17 @@ fn summary_new_crates() {
     );
     assert_eq!(json.popular_keywords[0].keyword, "popular");
     assert_eq!(json.popular_categories[0].category, "Category 1");
-    assert_eq!(json.just_updated.len(), 1);
-    assert_eq!(json.just_updated[0].name, "just_updated");
-    assert_eq!(json.new_crates.len(), 4);
+    assert_eq!(json.just_updated.len(), 2);
+
+    assert_eq!(json.just_updated[0].name, "just_updated_patch");
+    assert_eq!(json.just_updated[0].max_version, "0.2.0");
+    assert_eq!(json.just_updated[0].newest_version, "0.1.1");
+
+    assert_eq!(json.just_updated[1].name, "just_updated");
+    assert_eq!(json.just_updated[1].max_version, "0.1.2");
+    assert_eq!(json.just_updated[1].newest_version, "0.1.2");
+
+    assert_eq!(json.new_crates.len(), 5);
 }
 
 #[test]
@@ -1505,7 +1539,6 @@ fn yank_by_a_non_owner_fails() {
 }
 
 #[test]
-#[allow(clippy::cognitive_complexity)]
 fn yank_max_version() {
     let (_, anon, _, token) = TestApp::full().with_token();
 
@@ -1587,6 +1620,73 @@ fn publish_after_yank_max_version() {
 
     let json = anon.show_crate("fyk_max");
     assert_eq!(json.krate.max_version, "2.0.0");
+}
+
+#[test]
+fn publish_records_an_audit_action() {
+    use cargo_registry::models::VersionOwnerAction;
+
+    let (app, anon, _, token) = TestApp::full().with_token();
+
+    app.db(|conn| assert!(VersionOwnerAction::all(&conn).unwrap().is_empty()));
+
+    // Upload a new crate, putting it in the git index
+    let crate_to_publish = PublishBuilder::new("fyk");
+    token.enqueue_publish(crate_to_publish).good();
+
+    // Make sure it has one publish audit action
+    let json = anon.show_version("fyk", "1.0.0");
+    let actions = json.version.audit_actions;
+
+    assert_eq!(actions.len(), 1);
+    let action = &actions[0];
+    assert_eq!(action.action, "publish");
+    assert_eq!(action.user.id, token.as_model().user_id);
+}
+
+#[test]
+fn yank_records_an_audit_action() {
+    let (_, anon, _, token) = TestApp::full().with_token();
+
+    // Upload a new crate, putting it in the git index
+    let crate_to_publish = PublishBuilder::new("fyk");
+    token.enqueue_publish(crate_to_publish).good();
+
+    // Yank it
+    token.yank("fyk", "1.0.0").good();
+
+    // Make sure it has one publish and one yank audit action
+    let json = anon.show_version("fyk", "1.0.0");
+    let actions = json.version.audit_actions;
+
+    assert_eq!(actions.len(), 2);
+    let action = &actions[1];
+    assert_eq!(action.action, "yank");
+    assert_eq!(action.user.id, token.as_model().user_id);
+}
+
+#[test]
+fn unyank_records_an_audit_action() {
+    let (_, anon, _, token) = TestApp::full().with_token();
+
+    // Upload a new crate
+    let crate_to_publish = PublishBuilder::new("fyk");
+    token.enqueue_publish(crate_to_publish).good();
+
+    // Yank version 1.0.0
+    token.yank("fyk", "1.0.0").good();
+
+    // Unyank version 1.0.0
+    token.unyank("fyk", "1.0.0").good();
+
+    // Make sure it has one publish, one yank, and one unyank audit action
+    let json = anon.show_version("fyk", "1.0.0");
+    let actions = json.version.audit_actions;
+
+    assert_eq!(actions.len(), 3);
+    let action = &actions[2];
+    assert_eq!(action.action, "unyank");
+    assert_eq!(action.user.id, token.as_model().user_id);
 }
 
 #[test]
@@ -1901,6 +2001,31 @@ fn reverse_dependencies_includes_published_by_user_when_present() {
         c3_version.published_by.as_ref().unwrap().login,
         user.gh_login
     );
+}
+
+#[test]
+fn reverse_dependencies_query_supports_u64_version_number_parts() {
+    let (app, anon, user) = TestApp::init().with_user();
+    let user = user.as_model();
+
+    let large_but_valid_version_number = format!("1.0.{}", std::u64::MAX);
+
+    app.db(|conn| {
+        let c1 = CrateBuilder::new("c1", user.id).expect_build(conn);
+        // The crate that depends on c1...
+        CrateBuilder::new("c2", user.id)
+            // ...has a patch version at the limits of what the semver crate supports
+            .version(VersionBuilder::new(&large_but_valid_version_number).dependency(&c1, None))
+            .expect_build(conn);
+    });
+
+    let deps = anon.reverse_dependencies("c1");
+    assert_eq!(deps.dependencies.len(), 1);
+    assert_eq!(deps.meta.total, 1);
+    assert_eq!(deps.dependencies[0].crate_id, "c1");
+    assert_eq!(deps.versions.len(), 1);
+    assert_eq!(deps.versions[0].krate, "c2");
+    assert_eq!(deps.versions[0].num, large_but_valid_version_number);
 }
 
 #[test]
@@ -2230,11 +2355,40 @@ fn pagination_links_included_if_applicable() {
     let page1 = anon.search("per_page=1");
     let page2 = anon.search("page=2&per_page=1");
     let page3 = anon.search("page=3&per_page=1");
+    let page4 = anon.search("page=4&per_page=1");
 
     assert_eq!(Some("?per_page=1&page=2".to_string()), page1.meta.next_page);
     assert_eq!(None, page1.meta.prev_page);
     assert_eq!(Some("?page=3&per_page=1".to_string()), page2.meta.next_page);
     assert_eq!(Some("?page=1&per_page=1".to_string()), page2.meta.prev_page);
-    assert_eq!(None, page3.meta.next_page);
+    assert_eq!(None, page4.meta.next_page);
     assert_eq!(Some("?page=2&per_page=1".to_string()), page3.meta.prev_page);
+}
+
+#[test]
+fn pagination_parameters_only_accept_integers() {
+    let (app, anon, user) = TestApp::init().with_user();
+    let user = user.as_model();
+
+    app.db(|conn| {
+        CrateBuilder::new("pagination_links_1", user.id).expect_build(conn);
+        CrateBuilder::new("pagination_links_2", user.id).expect_build(conn);
+        CrateBuilder::new("pagination_links_3", user.id).expect_build(conn);
+    });
+
+    let invalid_per_page_json = anon
+        .get_with_query::<()>("/api/v1/crates", "page=1&per_page=100%22%EF%BC%8Cexception")
+        .bad_with_status(400);
+    assert_eq!(
+        invalid_per_page_json.errors[0].detail,
+        "invalid digit found in string"
+    );
+
+    let invalid_page_json = anon
+        .get_with_query::<()>("/api/v1/crates", "page=100%22%EF%BC%8Cexception&per_page=1")
+        .bad_with_status(400);
+    assert_eq!(
+        invalid_page_json.errors[0].detail,
+        "invalid digit found in string"
+    );
 }

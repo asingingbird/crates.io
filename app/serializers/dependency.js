@@ -1,7 +1,7 @@
-import DS from 'ember-data';
+import ApplicationSerializer from './application';
 
-export default DS.RESTSerializer.extend({
-    attrs: {
-        version: 'version_id',
-    },
+export default ApplicationSerializer.extend({
+  attrs: {
+    version: 'version_id',
+  },
 });

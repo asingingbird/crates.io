@@ -1,6 +1,6 @@
-use cargo_registry::util::{internal, CargoResult};
+use cargo_registry::util::Error;
 
-use reqwest::{header, StatusCode as Status};
+use reqwest::{blocking::Client, header, StatusCode as Status};
 
 #[derive(serde::Serialize, Debug)]
 #[serde(rename_all = "snake_case", tag = "event_type")]
@@ -25,11 +25,11 @@ impl Event {
     ///
     /// If the variant is `Trigger`, this will page whoever is on call
     /// (potentially waking them up at 3 AM).
-    pub fn send(self) -> CargoResult<()> {
+    pub fn send(self) -> Result<(), Error> {
         let api_token = dotenv::var("PAGERDUTY_API_TOKEN")?;
         let service_key = dotenv::var("PAGERDUTY_INTEGRATION_KEY")?;
 
-        let mut response = reqwest::Client::new()
+        let response = Client::new()
             .post("https://events.pagerduty.com/generic/2010-04-15/create_event.json")
             .header(header::ACCEPT, "application/vnd.pagerduty+json;version=2")
             .header(header::AUTHORIZATION, format!("Token token={}", api_token))
@@ -43,14 +43,15 @@ impl Event {
             s if s.is_success() => Ok(()),
             Status::BAD_REQUEST => {
                 let error = response.json::<InvalidEvent>()?;
-                Err(internal(&format_args!("pagerduty error: {:?}", error)))
+                Err(format!("pagerduty error: {:?}", error))
             }
-            Status::FORBIDDEN => Err(internal("rate limited by pagerduty")),
-            n => Err(internal(&format_args!(
+            Status::FORBIDDEN => Err("rate limited by pagerduty".to_string()),
+            n => Err(format!(
                 "Got a non 200 response code from pagerduty: {} with {:?}",
                 n, response
-            ))),
+            )),
         }
+        .map_err(Into::into)
     }
 }
 

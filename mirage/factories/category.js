@@ -1,20 +1,20 @@
-import { Factory, faker } from 'ember-cli-mirage';
+import { Factory } from 'ember-cli-mirage';
 import { dasherize } from '@ember/string';
 
 export default Factory.extend({
-    category(i) {
-        return `Category ${i}`;
-    },
+  category: i => `Category ${i}`,
 
-    id() {
-        return dasherize(this.category);
-    },
+  slug() {
+    return dasherize(this.category);
+  },
 
-    slug() {
-        return dasherize(this.category);
-    },
+  id() {
+    return this.slug;
+  },
 
-    description: () => faker.lorem.sentence(),
-    created_at: () => faker.date.past(),
-    crates_cnt: () => faker.random.number({ max: 5000 }),
+  description() {
+    return `This is the description for the category called "${this.category}"`;
+  },
+
+  created_at: '2010-06-16T21:30:45Z',
 });

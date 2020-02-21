@@ -4,14 +4,14 @@
 //! Usage:
 //!     cargo run --bin monitor
 
-#![deny(warnings, clippy::all, rust_2018_idioms)]
+#![warn(clippy::all, rust_2018_idioms)]
 
 mod on_call;
 
-use cargo_registry::{db, schema::*, util::CargoResult};
+use cargo_registry::{db, schema::*, util::Error};
 use diesel::prelude::*;
 
-fn main() -> CargoResult<()> {
+fn main() -> Result<(), Error> {
     let conn = db::connect_now()?;
 
     check_stalled_background_jobs(&conn)?;
@@ -19,7 +19,7 @@ fn main() -> CargoResult<()> {
     Ok(())
 }
 
-fn check_stalled_background_jobs(conn: &PgConnection) -> CargoResult<()> {
+fn check_stalled_background_jobs(conn: &PgConnection) -> Result<(), Error> {
     use cargo_registry::schema::background_jobs::dsl::*;
     use diesel::dsl::*;
 
@@ -55,7 +55,7 @@ fn check_stalled_background_jobs(conn: &PgConnection) -> CargoResult<()> {
     Ok(())
 }
 
-fn check_spam_attack(conn: &PgConnection) -> CargoResult<()> {
+fn check_spam_attack(conn: &PgConnection) -> Result<(), Error> {
     use cargo_registry::models::krate::canon_crate_name;
     use diesel::dsl::*;
     use diesel::sql_types::Bool;
@@ -116,7 +116,7 @@ fn check_spam_attack(conn: &PgConnection) -> CargoResult<()> {
     Ok(())
 }
 
-fn log_and_trigger_event(event: on_call::Event) -> CargoResult<()> {
+fn log_and_trigger_event(event: on_call::Event) -> Result<(), Error> {
     match event {
         on_call::Event::Trigger {
             ref description, ..

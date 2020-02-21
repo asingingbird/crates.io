@@ -1,17 +1,22 @@
 use conduit::Request;
 use flate2::read::GzDecoder;
+use openssl::error::ErrorStack;
 use openssl::hash::{Hasher, MessageDigest};
+use reqwest::{blocking::Client, header};
 
-use crate::util::LimitErrorReader;
-use crate::util::{human, internal, CargoResult, ChainError, Maximums};
+use crate::util::errors::{cargo_err, internal, AppResult, ChainError};
+use crate::util::{Error, LimitErrorReader, Maximums};
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 
 use crate::middleware::app::RequestApp;
 use crate::models::Crate;
+
+const CACHE_CONTROL_IMMUTABLE: &str = "public,max-age=31536000,immutable";
+const CACHE_CONTROL_README: &str = "public,max-age=604800";
 
 #[derive(Clone, Debug)]
 pub enum Uploader {
@@ -70,43 +75,53 @@ impl Uploader {
         }
     }
 
-    /// Returns the interna path of an uploaded crate's version archive.
+    /// Returns the internal path of an uploaded crate's version archive.
     fn crate_path(name: &str, version: &str) -> String {
         // No slash in front so we can use join
         format!("crates/{}/{}-{}.crate", name, name, version)
     }
 
-    /// Returns the interna path of an uploaded crate's version readme.
+    /// Returns the internal path of an uploaded crate's version readme.
     fn readme_path(name: &str, version: &str) -> String {
         format!("readmes/{}/{}-{}.html", name, name, version)
     }
 
     /// Uploads a file using the configured uploader (either `S3`, `Local`).
     ///
-    /// It returns a a tuple containing the path of the uploaded file
-    /// and its checksum.
-    pub fn upload(
+    /// It returns the path of the uploaded file.
+    ///
+    /// # Panics
+    ///
+    /// This function can panic on an `Self::Local` during development.
+    /// Production and tests use `Self::S3` which should not panic.
+    pub fn upload<R: std::io::Read + Send + 'static>(
         &self,
-        client: &reqwest::Client,
+        client: &Client,
         path: &str,
-        body: Vec<u8>,
+        mut content: R,
+        content_length: u64,
         content_type: &str,
-    ) -> CargoResult<(Option<String>, Vec<u8>)> {
-        let hash = hash(&body);
+        extra_headers: header::HeaderMap,
+    ) -> Result<Option<String>, Error> {
         match *self {
             Uploader::S3 { ref bucket, .. } => {
-                bucket
-                    .put(client, path, body, content_type)
-                    .map_err(|e| internal(&format_args!("failed to upload to S3: {}", e)))?;
-                Ok((Some(String::from(path)), hash))
+                bucket.put(
+                    client,
+                    path,
+                    content,
+                    content_length,
+                    content_type,
+                    extra_headers,
+                )?;
+                Ok(Some(String::from(path)))
             }
             Uploader::Local => {
                 let filename = env::current_dir().unwrap().join("local_uploads").join(path);
                 let dir = filename.parent().unwrap();
                 fs::create_dir_all(dir)?;
                 let mut file = File::create(&filename)?;
-                file.write_all(&body)?;
-                Ok((filename.to_str().map(String::from), hash))
+                std::io::copy(&mut content, &mut file)?;
+                Ok(filename.to_str().map(String::from))
             }
         }
     }
@@ -118,27 +133,52 @@ impl Uploader {
         krate: &Crate,
         maximums: Maximums,
         vers: &semver::Version,
-    ) -> CargoResult<Vec<u8>> {
+    ) -> AppResult<Vec<u8>> {
         let app = Arc::clone(req.app());
-        let (_, checksum) = {
-            let path = Uploader::crate_path(&krate.name, &vers.to_string());
-            let mut body = Vec::new();
-            LimitErrorReader::new(req.body(), maximums.max_upload_size).read_to_end(&mut body)?;
-            verify_tarball(krate, vers, &body, maximums.max_unpack_size)?;
-            self.upload(app.http_client(), &path, body, "application/x-tar")?
-        };
+        let path = Uploader::crate_path(&krate.name, &vers.to_string());
+        let mut body = Vec::new();
+        LimitErrorReader::new(req.body(), maximums.max_upload_size).read_to_end(&mut body)?;
+        verify_tarball(krate, vers, &body, maximums.max_unpack_size)?;
+        let checksum = hash(&body)?;
+        let content_length = body.len() as u64;
+        let content = Cursor::new(body);
+        let mut extra_headers = header::HeaderMap::new();
+        extra_headers.insert(
+            header::CACHE_CONTROL,
+            CACHE_CONTROL_IMMUTABLE.parse().unwrap(),
+        );
+        self.upload(
+            app.http_client(),
+            &path,
+            content,
+            content_length,
+            "application/x-tar",
+            extra_headers,
+        )
+        .map_err(|e| internal(&format_args!("failed to upload crate: {}", e)))?;
         Ok(checksum)
     }
 
     pub(crate) fn upload_readme(
         &self,
-        http_client: &reqwest::Client,
+        http_client: &Client,
         crate_name: &str,
         vers: &str,
         readme: String,
-    ) -> CargoResult<()> {
+    ) -> Result<(), Error> {
         let path = Uploader::readme_path(crate_name, vers);
-        self.upload(http_client, &path, readme.into_bytes(), "text/html")?;
+        let content_length = readme.len() as u64;
+        let content = Cursor::new(readme);
+        let mut extra_headers = header::HeaderMap::new();
+        extra_headers.insert(header::CACHE_CONTROL, CACHE_CONTROL_README.parse().unwrap());
+        self.upload(
+            http_client,
+            &path,
+            content,
+            content_length,
+            "text/html",
+            extra_headers,
+        )?;
         Ok(())
     }
 }
@@ -148,7 +188,7 @@ fn verify_tarball(
     vers: &semver::Version,
     tarball: &[u8],
     max_unpack: u64,
-) -> CargoResult<()> {
+) -> AppResult<()> {
     // All our data is currently encoded with gzip
     let decoder = GzDecoder::new(tarball);
 
@@ -161,7 +201,7 @@ fn verify_tarball(
     let prefix = format!("{}-{}", krate.name, vers);
     for entry in archive.entries()? {
         let entry = entry.chain_error(|| {
-            human("uploaded tarball is malformed or too large when decompressed")
+            cargo_err("uploaded tarball is malformed or too large when decompressed")
         })?;
 
         // Verify that all entries actually start with `$name-$vers/`.
@@ -170,7 +210,7 @@ fn verify_tarball(
         // as `bar-0.1.0/` source code, and this could overwrite other crates in
         // the registry!
         if !entry.path()?.starts_with(&prefix) {
-            return Err(human("invalid tarball uploaded"));
+            return Err(cargo_err("invalid tarball uploaded"));
         }
 
         // Historical versions of the `tar` crate which Cargo uses internally
@@ -180,14 +220,14 @@ fn verify_tarball(
         // generate a tarball with these file types so this should work for now.
         let entry_type = entry.header().entry_type();
         if entry_type.is_hard_link() || entry_type.is_symlink() {
-            return Err(human("invalid tarball uploaded"));
+            return Err(cargo_err("invalid tarball uploaded"));
         }
     }
     Ok(())
 }
 
-fn hash(data: &[u8]) -> Vec<u8> {
-    let mut hasher = Hasher::new(MessageDigest::sha256()).unwrap();
-    hasher.update(data).unwrap();
-    hasher.finish().unwrap().to_vec()
+fn hash(data: &[u8]) -> Result<Vec<u8>, ErrorStack> {
+    let mut hasher = Hasher::new(MessageDigest::sha256())?;
+    hasher.update(data)?;
+    Ok(hasher.finish()?.to_vec())
 }

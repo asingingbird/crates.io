@@ -1,15 +1,16 @@
-use crate::controllers::prelude::*;
+use crate::controllers::frontend_prelude::*;
 
 use crate::github;
 use conduit_cookie::RequestSession;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use failure::Fail;
+use oauth2::{prelude::*, AuthorizationCode, TokenResponse};
 
+use crate::middleware::current_user::TrustedUserId;
 use crate::models::{NewUser, User};
 use crate::schema::users;
-use crate::util::errors::{CargoError, ReadOnlyMode};
+use crate::util::errors::ReadOnlyMode;
 
-/// Handles the `GET /authorize_url` route.
+/// Handles the `GET /api/private/session/begin` route.
 ///
 /// This route will return an authorization URL for the GitHub OAuth flow including the crates.io
 /// `client_id` and a randomly generated `state` secret.
@@ -24,17 +25,14 @@ use crate::util::errors::{CargoError, ReadOnlyMode};
 ///     "url": "https://github.com/login/oauth/authorize?client_id=...&state=...&scope=read%3Aorg"
 /// }
 /// ```
-pub fn github_authorize(req: &mut dyn Request) -> CargoResult<Response> {
-    // Generate a random 16 char ASCII string
-    let mut rng = thread_rng();
-    let state: String = std::iter::repeat(())
-        .map(|()| rng.sample(Alphanumeric))
-        .take(16)
-        .collect();
+pub fn begin(req: &mut dyn Request) -> AppResult<Response> {
+    let (url, state) = req
+        .app()
+        .github
+        .authorize_url(oauth2::CsrfToken::new_random);
+    let state = state.secret().to_string();
     req.session()
         .insert("github_oauth_state".to_string(), state.clone());
-
-    let url = req.app().github.authorize_url(state.clone());
 
     #[derive(Serialize)]
     struct R {
@@ -47,7 +45,7 @@ pub fn github_authorize(req: &mut dyn Request) -> CargoResult<Response> {
     }))
 }
 
-/// Handles the `GET /authorize` route.
+/// Handles the `GET /api/private/session/authorize` route.
 ///
 /// This route is called from the GitHub API OAuth flow after the user accepted or rejected
 /// the data access permissions. It will check the `state` parameter and then call the GitHub API
@@ -75,7 +73,7 @@ pub fn github_authorize(req: &mut dyn Request) -> CargoResult<Response> {
 ///     }
 /// }
 /// ```
-pub fn github_access_token(req: &mut dyn Request) -> CargoResult<Response> {
+pub fn authorize(req: &mut dyn Request) -> AppResult<Response> {
     // Parse the url query
     let mut query = req.query();
     let code = query.remove("code").unwrap_or_default();
@@ -85,21 +83,31 @@ pub fn github_access_token(req: &mut dyn Request) -> CargoResult<Response> {
     // should have issued earlier.
     {
         let session_state = req.session().remove(&"github_oauth_state".to_string());
-        let session_state = session_state.as_ref().map(|a| &a[..]);
+        let session_state = session_state.as_deref();
         if Some(&state[..]) != session_state {
-            return Err(human("invalid state parameter"));
+            return Err(bad_request("invalid state parameter"));
         }
     }
 
-    // Fetch the access token from github using the code we just got
-    let token = req.app().github.exchange(code).map_err(|s| human(&s))?;
+    // Fetch the access token from GitHub using the code we just got
+    let code = AuthorizationCode::new(code);
+    let token = req
+        .app()
+        .github
+        .exchange_code(code)
+        .map_err(|e| e.compat())
+        .chain_error(|| server_error("Error obtaining token"))?;
+    let token = token.access_token();
 
-    let ghuser = github::github::<GithubUser>(req.app(), "/user", &token)?;
-    let user = ghuser.save_to_database(&token.access_token, &*req.db_conn()?)?;
+    // Fetch the user info from GitHub using the access token we just got and create a user record
+    let ghuser = github::github_api::<GithubUser>(req.app(), "/user", token)?;
+    let user = ghuser.save_to_database(&token.secret(), &*req.db_conn()?)?;
 
+    // Log in by setting a cookie and the middleware authentication
     req.session()
         .insert("user_id".to_string(), user.id.to_string());
-    req.mut_extensions().insert(user);
+    req.mut_extensions().insert(TrustedUserId(user.id));
+
     super::me::me(req)
 }
 
@@ -113,18 +121,17 @@ struct GithubUser {
 }
 
 impl GithubUser {
-    fn save_to_database(&self, access_token: &str, conn: &PgConnection) -> CargoResult<User> {
+    fn save_to_database(&self, access_token: &str, conn: &PgConnection) -> AppResult<User> {
         NewUser::new(
             self.id,
             &self.login,
-            self.email.as_ref().map(|s| &s[..]),
-            self.name.as_ref().map(|s| &s[..]),
-            self.avatar_url.as_ref().map(|s| &s[..]),
+            self.name.as_deref(),
+            self.avatar_url.as_deref(),
             access_token,
         )
-        .create_or_update(conn)
+        .create_or_update(self.email.as_deref(), conn)
         .map_err(Into::into)
-        .or_else(|e: Box<dyn CargoError>| {
+        .or_else(|e: Box<dyn AppError>| {
             // If we're in read only mode, we can't update their details
             // just look for an existing user
             if e.is::<ReadOnlyMode>() {
@@ -140,8 +147,8 @@ impl GithubUser {
     }
 }
 
-/// Handles the `GET /logout` route.
-pub fn logout(req: &mut dyn Request) -> CargoResult<Response> {
+/// Handles the `DELETE /api/private/session` route.
+pub fn logout(req: &mut dyn Request) -> AppResult<Response> {
     req.session().remove(&"user_id".to_string());
     Ok(req.json(&true))
 }

@@ -3,15 +3,17 @@ use diesel::associations::Identifiable;
 use diesel::pg::Pg;
 use diesel::prelude::*;
 use diesel::sql_types::Bool;
+use indexmap::IndexMap;
 use url::Url;
 
 use crate::app::App;
-use crate::util::{human, CargoResult};
-
+use crate::email;
+use crate::models::version::TopVersions;
 use crate::models::{
-    Badge, Category, CrateOwner, Keyword, NewCrateOwnerInvitation, Owner, OwnerKind,
-    ReverseDependency, User, Version,
+    Badge, Category, CrateOwner, CrateOwnerInvitation, Keyword, NewCrateOwnerInvitation, Owner,
+    OwnerKind, ReverseDependency, User, Version,
 };
+use crate::util::errors::{cargo_err, AppResult};
 use crate::views::{EncodableCrate, EncodableCrateLinks};
 
 use crate::models::helpers::with_count::*;
@@ -42,7 +44,6 @@ pub struct Crate {
     pub description: Option<String>,
     pub homepage: Option<String>,
     pub documentation: Option<String>,
-    pub license: Option<String>,
     pub repository: Option<String>,
     pub max_upload_size: Option<i32>,
 }
@@ -58,7 +59,6 @@ type AllColumns = (
     crates::description,
     crates::homepage,
     crates::documentation,
-    crates::license,
     crates::repository,
     crates::max_upload_size,
 );
@@ -72,7 +72,6 @@ pub const ALL_COLUMNS: AllColumns = (
     crates::description,
     crates::homepage,
     crates::documentation,
-    crates::license,
     crates::repository,
     crates::max_upload_size,
 );
@@ -97,20 +96,18 @@ pub struct NewCrate<'a> {
     pub readme: Option<&'a str>,
     pub repository: Option<&'a str>,
     pub max_upload_size: Option<i32>,
-    pub license: Option<&'a str>,
 }
 
 impl<'a> NewCrate<'a> {
     pub fn create_or_update(
-        mut self,
+        self,
         conn: &PgConnection,
-        license_file: Option<&'a str>,
         uploader: i32,
         rate_limit: Option<&PublishRateLimit>,
-    ) -> CargoResult<Crate> {
+    ) -> AppResult<Crate> {
         use diesel::update;
 
-        self.validate(license_file)?;
+        self.validate()?;
         self.ensure_name_not_reserved(conn)?;
 
         conn.transaction(|| {
@@ -132,63 +129,36 @@ impl<'a> NewCrate<'a> {
         })
     }
 
-    fn validate(&mut self, license_file: Option<&'a str>) -> CargoResult<()> {
-        fn validate_url(url: Option<&str>, field: &str) -> CargoResult<()> {
+    fn validate(&self) -> AppResult<()> {
+        fn validate_url(url: Option<&str>, field: &str) -> AppResult<()> {
             let url = match url {
                 Some(s) => s,
                 None => return Ok(()),
             };
-            let url = Url::parse(url)
-                .map_err(|_| human(&format_args!("`{}` is not a valid url: `{}`", field, url)))?;
-            match &url.scheme()[..] {
-                "http" | "https" => {}
-                s => {
-                    return Err(human(&format_args!(
-                        "`{}` has an invalid url \
-                         scheme: `{}`",
-                        field, s
-                    )));
-                }
-            }
-            if url.cannot_be_a_base() {
-                return Err(human(&format_args!(
-                    "`{}` must have relative scheme \
-                     data: {}",
+
+            // Manually check the string, as `Url::parse` may normalize relative URLs
+            // making it difficult to ensure that both slashes are present.
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(cargo_err(&format_args!(
+                    "URL for field `{}` must begin with http:// or https:// (url: {})",
                     field, url
                 )));
             }
+
+            // Ensure the entire URL parses as well
+            Url::parse(url).map_err(|_| {
+                cargo_err(&format_args!("`{}` is not a valid url: `{}`", field, url))
+            })?;
             Ok(())
         }
 
         validate_url(self.homepage, "homepage")?;
         validate_url(self.documentation, "documentation")?;
         validate_url(self.repository, "repository")?;
-        self.validate_license(license_file)?;
         Ok(())
     }
 
-    fn validate_license(&mut self, license_file: Option<&str>) -> CargoResult<()> {
-        if let Some(license) = self.license {
-            for part in license.split('/') {
-                license_exprs::validate_license_expr(part).map_err(|e| {
-                    human(&format_args!(
-                        "{}; see http://opensource.org/licenses \
-                         for options, and http://spdx.org/licenses/ \
-                         for their identifiers",
-                        e
-                    ))
-                })?;
-            }
-        } else if license_file.is_some() {
-            // If no license is given, but a license file is given, flag this
-            // crate as having a nonstandard license. Note that we don't
-            // actually do anything else with license_file currently.
-            self.license = Some("non-standard");
-        }
-        Ok(())
-    }
-
-    fn ensure_name_not_reserved(&self, conn: &PgConnection) -> CargoResult<()> {
+    fn ensure_name_not_reserved(&self, conn: &PgConnection) -> AppResult<()> {
         use crate::schema::reserved_crate_names::dsl::*;
         use diesel::dsl::exists;
         use diesel::select;
@@ -198,7 +168,7 @@ impl<'a> NewCrate<'a> {
         ))
         .get_result::<bool>(conn)?;
         if reserved_name {
-            Err(human("cannot upload a crate with a reserved name"))
+            Err(cargo_err("cannot upload a crate with a reserved name"))
         } else {
             Ok(())
         }
@@ -221,6 +191,7 @@ impl<'a> NewCrate<'a> {
                     owner_id: user_id,
                     created_by: user_id,
                     owner_kind: OwnerKind::User as i32,
+                    email_notifications: true,
                 };
                 diesel::insert_into(crate_owners::table)
                     .values(&owner)
@@ -233,7 +204,7 @@ impl<'a> NewCrate<'a> {
 }
 
 impl Crate {
-    /// SQL filter based on whether the crate's name loosly matches the given
+    /// SQL filter based on whether the crate's name loosely matches the given
     /// string.
     ///
     /// The operator used varies based on the input.
@@ -272,6 +243,18 @@ impl Crate {
         crates::table.select(ALL_COLUMNS)
     }
 
+    pub fn find_version(&self, conn: &PgConnection, version: &str) -> AppResult<Version> {
+        self.all_versions()
+            .filter(versions::num.eq(version))
+            .first(conn)
+            .map_err(|_| {
+                cargo_err(&format_args!(
+                    "crate `{}` does not have a version `{}`",
+                    self.name, version
+                ))
+            })
+    }
+
     pub fn valid_name(name: &str) -> bool {
         let under_max_length = name.chars().take(MAX_NAME_LENGTH + 1).count() <= MAX_NAME_LENGTH;
         Crate::valid_ident(name) && under_max_length
@@ -281,7 +264,7 @@ impl Crate {
         Self::valid_feature_name(name)
             && name
                 .chars()
-                .nth(0)
+                .next()
                 .map(char::is_alphabetic)
                 .unwrap_or(false)
     }
@@ -310,13 +293,13 @@ impl Crate {
 
     pub fn minimal_encodable(
         self,
-        max_version: &semver::Version,
+        top_versions: &TopVersions,
         badges: Option<Vec<Badge>>,
         exact_match: bool,
         recent_downloads: Option<i64>,
     ) -> EncodableCrate {
         self.encodable(
-            max_version,
+            top_versions,
             None,
             None,
             None,
@@ -329,7 +312,7 @@ impl Crate {
     #[allow(clippy::too_many_arguments)]
     pub fn encodable(
         self,
-        max_version: &semver::Version,
+        top_versions: &TopVersions,
         versions: Option<Vec<i32>>,
         keywords: Option<&[Keyword]>,
         categories: Option<&[Category]>,
@@ -368,7 +351,8 @@ impl Crate {
             keywords: keyword_ids,
             categories: category_ids,
             badges,
-            max_version: max_version.to_string(),
+            max_version: top_versions.highest.to_string(),
+            newest_version: top_versions.newest.to_string(),
             documentation,
             homepage,
             exact_match,
@@ -413,31 +397,30 @@ impl Crate {
         }
     }
 
-    pub fn max_version(&self, conn: &PgConnection) -> CargoResult<semver::Version> {
+    /// Return both the newest (most recently updated) and
+    /// highest version (in semver order) for the current crate.
+    pub fn top_versions(&self, conn: &PgConnection) -> QueryResult<TopVersions> {
         use crate::schema::versions::dsl::*;
 
-        let vs = self
-            .versions()
-            .select(num)
-            .load::<String>(conn)?
-            .into_iter()
-            .map(|s| semver::Version::parse(&s).unwrap());
-        Ok(Version::max(vs))
+        Ok(Version::top(
+            self.versions()
+                .select((updated_at, num))
+                .load::<(NaiveDateTime, semver::Version)>(conn)?,
+        ))
     }
 
-    pub fn owners(&self, conn: &PgConnection) -> CargoResult<Vec<Owner>> {
-        let base_query = CrateOwner::belonging_to(self).filter(crate_owners::deleted.eq(false));
-        let users = base_query
+    pub fn owners(&self, conn: &PgConnection) -> QueryResult<Vec<Owner>> {
+        let users = CrateOwner::by_owner_kind(OwnerKind::User)
+            .filter(crate_owners::crate_id.eq(self.id))
             .inner_join(users::table)
             .select(users::all_columns)
-            .filter(crate_owners::owner_kind.eq(OwnerKind::User as i32))
             .load(conn)?
             .into_iter()
             .map(Owner::User);
-        let teams = base_query
+        let teams = CrateOwner::by_owner_kind(OwnerKind::Team)
+            .filter(crate_owners::crate_id.eq(self.id))
             .inner_join(teams::table)
             .select(teams::all_columns)
-            .filter(crate_owners::owner_kind.eq(OwnerKind::Team as i32))
             .load(conn)?
             .into_iter()
             .map(Owner::Team);
@@ -451,26 +434,38 @@ impl Crate {
         conn: &PgConnection,
         req_user: &User,
         login: &str,
-    ) -> CargoResult<String> {
+    ) -> AppResult<String> {
         use diesel::insert_into;
 
         let owner = Owner::find_or_create_by_login(app, conn, req_user, login)?;
 
         match owner {
             // Users are invited and must accept before being added
-            owner @ Owner::User(_) => {
-                insert_into(crate_owner_invitations::table)
+            Owner::User(user) => {
+                let maybe_inserted = insert_into(crate_owner_invitations::table)
                     .values(&NewCrateOwnerInvitation {
-                        invited_user_id: owner.id(),
+                        invited_user_id: user.id,
                         invited_by_user_id: req_user.id,
                         crate_id: self.id,
                     })
                     .on_conflict_do_nothing()
-                    .execute(conn)?;
+                    .get_result::<CrateOwnerInvitation>(conn)
+                    .optional()?;
+
+                if let Some(ownership_invitation) = maybe_inserted {
+                    if let Ok(Some(email)) = user.verified_email(&conn) {
+                        email::send_owner_invite_email(
+                            &email.as_str(),
+                            &req_user.gh_login.as_str(),
+                            &self.name.as_str(),
+                            &ownership_invitation.token.as_str(),
+                        );
+                    }
+                }
+
                 Ok(format!(
                     "user {} has been invited to be an owner of crate {}",
-                    owner.login(),
-                    self.name
+                    user.gh_login, self.name
                 ))
             }
             // Teams are added as owners immediately
@@ -481,6 +476,7 @@ impl Crate {
                         owner_id: owner.id(),
                         created_by: req_user.id,
                         owner_kind: OwnerKind::Team as i32,
+                        email_notifications: true,
                     })
                     .on_conflict(crate_owners::table.primary_key())
                     .do_update()
@@ -502,7 +498,7 @@ impl Crate {
         conn: &PgConnection,
         req_user: &User,
         login: &str,
-    ) -> CargoResult<()> {
+    ) -> AppResult<()> {
         let owner = Owner::find_or_create_by_login(app, conn, req_user, login)?;
 
         let target = crate_owners::table.find((self.id(), owner.id(), owner.kind() as i32));
@@ -522,16 +518,22 @@ impl Crate {
     pub fn reverse_dependencies(
         &self,
         conn: &PgConnection,
-        offset: i64,
-        limit: i64,
-    ) -> QueryResult<(Vec<ReverseDependency>, i64)> {
+        params: &IndexMap<String, String>,
+    ) -> AppResult<(Vec<ReverseDependency>, i64)> {
+        use crate::controllers::helpers::pagination::*;
         use diesel::sql_query;
         use diesel::sql_types::{BigInt, Integer};
 
+        // FIXME: It'd be great to support this with `.paginate` directly,
+        // and get cursor/id pagination for free. But Diesel doesn't currently
+        // have great support for abstracting over "Is this using `Queryable`
+        // or `QueryableByName` to load things?"
+        let options = PaginationOptions::new(params)?;
+        let offset = options.offset().unwrap_or_default();
         let rows = sql_query(include_str!("krate_reverse_dependencies.sql"))
             .bind::<Integer, _>(self.id)
-            .bind::<BigInt, _>(offset)
-            .bind::<BigInt, _>(limit)
+            .bind::<BigInt, _>(i64::from(offset))
+            .bind::<BigInt, _>(i64::from(options.per_page))
             .load::<WithCount<ReverseDependency>>(conn)?;
 
         Ok(rows.records_and_total())
@@ -544,7 +546,21 @@ sql_function!(fn to_char(a: Date, b: Text) -> Text);
 
 #[cfg(test)]
 mod tests {
-    use crate::models::Crate;
+    use crate::models::{Crate, NewCrate};
+
+    #[test]
+    fn deny_relative_urls() {
+        let krate = NewCrate {
+            name: "name",
+            description: None,
+            homepage: Some("https:/example.com/home"),
+            documentation: None,
+            readme: None,
+            repository: None,
+            max_upload_size: None,
+        };
+        assert!(krate.validate().is_err());
+    }
 
     #[test]
     fn documentation_blocked_no_url_provided() {

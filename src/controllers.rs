@@ -1,3 +1,13 @@
+mod cargo_prelude {
+    pub use super::prelude::*;
+    pub use crate::util::errors::cargo_err;
+}
+
+mod frontend_prelude {
+    pub use super::prelude::*;
+    pub use crate::util::errors::{bad_request, server_error};
+}
+
 mod prelude {
     pub use super::helpers::ok_true;
     pub use diesel::prelude::*;
@@ -6,10 +16,9 @@ mod prelude {
     pub use conduit_router::RequestParams;
 
     pub use crate::db::RequestTransaction;
-    pub use crate::util::{human, CargoResult};
+    pub use crate::util::errors::{cargo_err, AppError, AppResult, ChainError}; // TODO: Remove cargo_err from here
 
     pub use crate::middleware::app::RequestApp;
-    pub use crate::middleware::current_user::RequestUser;
 
     use std::collections::HashMap;
     use std::io;
@@ -18,13 +27,17 @@ mod prelude {
     use serde::Serialize;
     use url;
 
+    pub trait UserAuthenticationExt {
+        fn authenticate(&self, conn: &PgConnection) -> AppResult<super::util::AuthenticatedUser>;
+    }
+
     pub trait RequestUtils {
         fn redirect(&self, url: String) -> Response;
 
         fn json<T: Serialize>(&self, t: &T) -> Response;
         fn query(&self) -> IndexMap<String, String>;
         fn wants_json(&self) -> bool;
-        fn pagination(&self, default: usize, max: usize) -> CargoResult<(i64, i64)>;
+        fn query_with_params(&self, params: IndexMap<String, String>) -> String;
     }
 
     impl<'a> RequestUtils for dyn Request + 'a {
@@ -34,7 +47,7 @@ mod prelude {
 
         fn query(&self) -> IndexMap<String, String> {
             url::form_urlencoded::parse(self.query_string().unwrap_or("").as_bytes())
-                .map(|(a, b)| (a.into_owned(), b.into_owned()))
+                .into_owned()
                 .collect()
         }
 
@@ -55,31 +68,19 @@ mod prelude {
                 .unwrap_or(false)
         }
 
-        fn pagination(&self, default: usize, max: usize) -> CargoResult<(i64, i64)> {
-            let query = self.query();
-            let page = query
-                .get("page")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1);
-            let limit = query
-                .get("per_page")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(default);
-            if limit > max {
-                return Err(human(&format_args!(
-                    "cannot request more than {} items",
-                    max
-                )));
-            }
-            if page == 0 {
-                return Err(human("page indexing starts from 1, page 0 is invalid"));
-            }
-            Ok((((page - 1) * limit) as i64, limit as i64))
+        fn query_with_params(&self, new_params: IndexMap<String, String>) -> String {
+            let mut params = self.query();
+            params.extend(new_params);
+            let query_string = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(params)
+                .finish();
+            format!("?{}", query_string)
         }
     }
 }
 
 pub mod helpers;
+mod util;
 
 pub mod category;
 pub mod crate_owner_invitation;
